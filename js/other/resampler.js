@@ -14,24 +14,82 @@ Resampler.prototype.initialize = function () {
 			//Setup a resampler bypass:
 			this.resampler = this.bypassResampler;		//Resampler just returns what was passed through.
 			this.ratioWeight = 1;
-			this.initializeBuffers(false);
 		}
 		else {
-			//Setup the interpolation resampler:
-			this.compileInterpolationFunction();
-			this.resampler = this.interpolate;			//Resampler is a custom quality interpolation algorithm.
+			if (this.fromSampleRate < this.toSampleRate) {
+				/*
+					Use generic linear interpolation if upsampling,
+					as linear interpolation produces a gradient that we want
+					and works fine with two input sample points per output in this case.
+				*/
+				this.compileLinearInterpolationFunction();
+				this.lastWeight = 1;
+			}
+			else {
+				/*
+					Custom resampler I wrote that doesn't skip samples
+					like standard linear interpolation in high downsampling.
+					This is more accurate than linear interpolation on downsampling.
+				*/
+				this.compileMultiTapFunction();
+				this.tailExists = false;
+				this.lastWeight = 0;
+			}
 			this.ratioWeight = this.fromSampleRate / this.toSampleRate;
-			this.tailExists = false;
-			this.lastWeight = 0;
-			this.initializeBuffers(true);
+			this.initializeBuffers();
 		}
 	}
 	else {
 		throw(new Error("Invalid settings specified for the resampler."));
 	}
 }
-Resampler.prototype.compileInterpolationFunction = function () {
-	var toCompile = "var bufferLength = Math.min(buffer.length, this.outputBufferSize);\
+Resampler.prototype.compileLinearInterpolationFunction = function () {
+	var toCompile = "var bufferLength = buffer.length;\
+	var outLength = this.outputBufferSize;\
+	if ((bufferLength % " + this.channels + ") == 0) {\
+		if (bufferLength > 0) {\
+			var ratioWeight = this.ratioWeight;\
+			var weight = this.lastWeight;\
+			var firstWeight = 0;\
+			var secondWeight = 0;\
+			var sourceOffset = 0;\
+			var outputOffset = 0;\
+			var outputBuffer = this.outputBuffer;\
+			for (; weight < 1; weight += ratioWeight) {\
+				secondWeight = weight % 1;\
+				firstWeight = 1 - secondWeight;";
+	for (var channel = 0; channel < this.channels; ++channel) {
+		toCompile += "outputBuffer[outputOffset++] = (this.lastOutput[" + channel + "] * firstWeight) + (buffer[" + channel + "] * secondWeight);";
+	}
+	toCompile += "}\
+			weight -= 1;\
+			for (bufferLength -= " + this.channels + ", sourceOffset = Math.floor(weight) * " + this.channels + "; outputOffset < outLength && sourceOffset < bufferLength;) {\
+				secondWeight = weight % 1;\
+				firstWeight = 1 - secondWeight;";
+	for (var channel = 0; channel < this.channels; ++channel) {
+		toCompile += "outputBuffer[outputOffset++] = (buffer[sourceOffset" + ((channel > 0) ? (" + " + channel) : "") + "] * firstWeight) + (buffer[sourceOffset + " + (this.channels + channel) + "] * secondWeight);";
+	}
+	toCompile += "weight += ratioWeight;\
+				sourceOffset = Math.floor(weight) * " + this.channels + ";\
+			}";
+	for (var channel = 0; channel < this.channels; ++channel) {
+		toCompile += "this.lastOutput[" + channel + "] = buffer[sourceOffset++];";
+	}
+	toCompile += "this.lastWeight = weight % 1;\
+			return this.bufferSlice(outputOffset);\
+		}\
+		else {\
+			return (this.noReturn) ? 0 : [];\
+		}\
+	}\
+	else {\
+		throw(new Error(\"Buffer was of incorrect sample length.\"));\
+	}";
+	this.resampler = Function("buffer", toCompile);
+}
+Resampler.prototype.compileMultiTapFunction = function () {
+	var toCompile = "var bufferLength = buffer.length;\
+	var outLength = this.outputBufferSize;\
 	if ((bufferLength % " + this.channels + ") == 0) {\
 		if (bufferLength > 0) {\
 			var ratioWeight = this.ratioWeight;\
@@ -64,9 +122,9 @@ Resampler.prototype.compileInterpolationFunction = function () {
 					amountToNext = 1 + actualPosition - currentPosition;\
 					if (weight >= amountToNext) {";
 	for (channel = 0; channel < this.channels; ++channel) {
-		toCompile += "output" + channel + " += buffer[actualPosition" + ((channel > 0) ? (" + " + channel) : "") + "] * amountToNext;"
+		toCompile += "output" + channel + " += buffer[actualPosition++] * amountToNext;"
 	}
-	toCompile += "actualPosition = currentPosition = actualPosition + " + this.channels + ";\
+	toCompile += "currentPosition = actualPosition;\
 						weight -= amountToNext;\
 					}\
 					else {";
@@ -91,7 +149,7 @@ Resampler.prototype.compileInterpolationFunction = function () {
 	toCompile += "this.tailExists = true;\
 					break;\
 				}\
-			} while (actualPosition < bufferLength);\
+			} while (actualPosition < bufferLength && outputOffset < outLength);\
 			return this.bufferSlice(outputOffset);\
 		}\
 		else {\
@@ -101,7 +159,7 @@ Resampler.prototype.compileInterpolationFunction = function () {
 	else {\
 		throw(new Error(\"Buffer was of incorrect sample length.\"));\
 	}";
-	this.interpolate = Function("buffer", toCompile);
+	this.resampler = Function("buffer", toCompile);
 }
 Resampler.prototype.bypassResampler = function (buffer) {
 	if (this.noReturn) {
@@ -137,18 +195,14 @@ Resampler.prototype.bufferSlice = function (sliceAmount) {
 		}
 	}
 }
-Resampler.prototype.initializeBuffers = function (generateTailCache) {
+Resampler.prototype.initializeBuffers = function () {
 	//Initialize the internal buffer:
 	try {
 		this.outputBuffer = new Float32Array(this.outputBufferSize);
-		if (generateTailCache) {
-			this.lastOutput = new Float32Array(this.channels);
-		}
+		this.lastOutput = new Float32Array(this.channels);
 	}
 	catch (error) {
 		this.outputBuffer = [];
-		if (generateTailCache) {
-			this.lastOutput = [];
-		}
+		this.lastOutput = [];
 	}
 }

@@ -6,8 +6,11 @@ class GameBoy extends site {
 	function start_processing() {
 		$this->title = 'GameBoy Online';
 		$this->script = '
-DEBUG_MESSAGES = true;
+DEBUG_MESSAGES = false;
 DEBUG_WINDOWING = false;
+window.onload = function () {
+	windowingInitialize();
+}
 ';
 		$this->script_alt = array(
 			$this->server->convert_out_of_set_chars($this->server->url['folder'].JSDIR.'/other/windowStack.js'),
@@ -19,11 +22,11 @@ DEBUG_WINDOWING = false;
 			$this->server->convert_out_of_set_chars($this->server->url['folder'].JSDIR.'/other/swfobject.js'),
 			$this->server->convert_out_of_set_chars($this->server->url['folder'].JSDIR.'/other/resampler.js'),
 			$this->server->convert_out_of_set_chars($this->server->url['folder'].JSDIR.'/other/XAudioServer.js'),
+			$this->server->convert_out_of_set_chars($this->server->url['folder'].JSDIR.'/other/resize.js'),
 			$this->server->convert_out_of_set_chars($this->server->url['folder'].JSDIR.'/GameBoyCore.js'),
 			$this->server->convert_out_of_set_chars($this->server->url['folder'].JSDIR.'/GameBoyIO.js')
 		);
-		//$this->meta = array('viewport'=>'width=device-width, height=device-height');
-		$this->style = '@import url("'.$this->server->convert_out_of_set_chars($this->server->url['folder'].CSSDIR.'/GameBoy.css.php').(($this->server->get('border-radius') == 'true') ? '?rounded=true' : '').'");';
+		$this->style = '@import url("'.$this->server->convert_out_of_set_chars($this->server->url['folder'].CSSDIR.'/GameBoy.css').(($this->server->get('border-radius') == 'true') ? '?rounded=true' : '').'");';
 		$this->manifest = $this->server->convert_out_of_set_chars($this->server->url['folder'].'gameboy.manifest.php');
 	}
 	function body_render() {
@@ -34,23 +37,14 @@ DEBUG_WINDOWING = false;
 		$this->displaySettings();
 		$this->displayInstructions();
 		$this->fileInput();
+		$this->saveInput();
+		$this->displayStorageListing();
+		$this->displayStoragePopup();
+		$this->displayFreezeListing();
 		//Generate the Pop-Ups:
 		$this->generatePopUps();
 		//Fullscreen canvas:
 		$this->fullscreenGenerate();
-		//DOM ready state queue:
-		$this->startElement('script');
-		$this->writeAttribute('type', 'text/javascript');
-		$this->text('
-try {
-	addEvent("DOMContentLoaded", document, windowingPreInitUnsafe);
-	addEvent("readystatechange", document, windowingPreInitSafe);
-}
-catch (error) {
-	alert("Could not initialize the emulator properly. Please try using a standards compliant browser.");
-}
-');
-		$this->endElement();
 	}
 	protected function emulatorMain() {
 		$this->startElement('div');
@@ -126,7 +120,7 @@ catch (error) {
 		$this->text('This is a GameBoy Color emulator written purely in JavaScript by Grant Galitz.');
 		$this->endElement();
 		$this->startElement('p');
-		$this->text('The graphics out is done through HTML5 canvas, with the putImageData function.');
+		$this->text('The graphics blitting is done through HTML5 canvas, with the putImageData and drawImage functions.');
 		$this->endElement();
 		$this->startElement('p');
 		$this->text('Save states are implemented through the window.localStorage object, and are serialized/deserialized through JSON.');
@@ -173,16 +167,6 @@ catch (error) {
 		$this->startElement('div');
 		$this->writeAttribute('class', 'setting');
 		$this->startElement('span');
-		$this->text('Force Mono Sound:');
-		$this->endElement();
-		$this->startElement('input');
-		$this->writeAttribute('type', 'checkbox');
-		$this->writeAttribute('id', 'enable_mono_sound');
-		$this->endElement();
-		$this->endElement();
-		$this->startElement('div');
-		$this->writeAttribute('class', 'setting');
-		$this->startElement('span');
 		$this->text('GB mode has priority over GBC mode:');
 		$this->endElement();
 		$this->startElement('input');
@@ -199,16 +183,6 @@ catch (error) {
 		$this->writeAttribute('type', 'checkbox');
 		$this->writeAttribute('checked', 'checked');
 		$this->writeAttribute('id', 'enable_gbc_bios');
-		$this->endElement();
-		$this->endElement();
-		$this->startElement('div');
-		$this->writeAttribute('class', 'setting');
-		$this->startElement('span');
-		$this->text('Auto frame skip:');
-		$this->endElement();
-		$this->startElement('input');
-		$this->writeAttribute('type', 'checkbox');
-		$this->writeAttribute('id', 'auto_frameskip');
 		$this->endElement();
 		$this->endElement();
 		$this->startElement('div');
@@ -268,16 +242,6 @@ catch (error) {
 		$this->startElement('div');
 		$this->writeAttribute('class', 'setting');
 		$this->startElement('span');
-		$this->text('JIT the rescaling algorithm:');
-		$this->endElement();
-		$this->startElement('input');
-		$this->writeAttribute('type', 'checkbox');
-		$this->writeAttribute('id', 'resizing_jit');
-		$this->endElement();
-		$this->endElement();
-		$this->startElement('div');
-		$this->writeAttribute('class', 'setting');
-		$this->startElement('span');
 		$this->text('Disallow typed arrays to be used:');
 		$this->endElement();
 		$this->startElement('input');
@@ -295,6 +259,17 @@ catch (error) {
 		$this->writeAttribute('id', 'gb_boot_rom_utilized');
 		$this->endElement();
 		$this->endElement();
+		$this->startElement('div');
+		$this->writeAttribute('class', 'setting');
+		$this->startElement('span');
+		$this->text('Smooth upon resizing canvas:');
+		$this->endElement();
+		$this->startElement('input');
+		$this->writeAttribute('type', 'checkbox');
+		$this->writeAttribute('checked', 'checked');
+		$this->writeAttribute('id', 'resize_smoothing');
+		$this->endElement();
+		$this->endElement();
 		$this->endElement();
 		$this->startElement('div');
 		$this->writeAttribute('class', 'button_rack');
@@ -302,6 +277,87 @@ catch (error) {
 		$this->writeAttribute('id', 'settings_close_button');
 		$this->writeAttribute('class', 'center');
 		$this->text('Close Settings');
+		$this->endElement();
+		$this->endElement();
+		$this->endElement();
+	}
+	protected function displayStorageListing() {
+		$this->startElement('div');
+		$this->writeAttribute('class', 'window');
+		$this->writeAttribute('id', 'local_storage_listing');
+		$this->startElement('div');
+		$this->writeAttribute('id', 'storageListingMasterContainer');
+		$this->writeAttribute('class', 'storageList');
+		$this->startElement('div');
+		$this->writeAttribute('id', 'storageListingMasterContainerSub');
+		$this->endElement();
+		$this->endElement();
+		$this->startElement('div');
+		$this->writeAttribute('id', 'download_all_storage');
+		$this->startElement('a');
+		$this->writeAttribute('href', 'about:blank');
+		$this->writeAttribute('id', 'download_local_storage_dba');
+		$this->text('Export all saved data.');
+		$this->endElement();
+		$this->endElement();
+		$this->startElement('div');
+		$this->writeAttribute('class', 'button_rack');
+		$this->startElement('button');
+		$this->writeAttribute('id', 'local_storage_list_refresh_button');
+		$this->writeAttribute('class', 'left');
+		$this->text('Refresh List');
+		$this->endElement();
+		$this->startElement('button');
+		$this->writeAttribute('id', 'local_storage_list_close_button');
+		$this->writeAttribute('class', 'right');
+		$this->text('Close Storage List');
+		$this->endElement();
+		$this->endElement();
+		$this->endElement();
+	}
+	protected function displayFreezeListing() {
+		$this->startElement('div');
+		$this->writeAttribute('class', 'window');
+		$this->writeAttribute('id', 'freeze_listing');
+		$this->startElement('div');
+		$this->writeAttribute('id', 'freezeListingMasterContainer');
+		$this->writeAttribute('class', 'storageList');
+		$this->startElement('div');
+		$this->writeAttribute('id', 'freezeListingMasterContainerSub');
+		$this->endElement();
+		$this->endElement();
+		$this->startElement('div');
+		$this->writeAttribute('class', 'button_rack');
+		$this->startElement('button');
+		$this->writeAttribute('id', 'freeze_list_refresh_button');
+		$this->writeAttribute('class', 'left');
+		$this->text('Refresh List');
+		$this->endElement();
+		$this->startElement('button');
+		$this->writeAttribute('id', 'freeze_list_close_button');
+		$this->writeAttribute('class', 'right');
+		$this->text('Close Freeze State List');
+		$this->endElement();
+		$this->endElement();
+		$this->endElement();
+	}
+	protected function displayStoragePopup() {
+		$this->startElement('div');
+		$this->writeAttribute('class', 'window');
+		$this->writeAttribute('id', 'local_storage_popup');
+		$this->startElement('div');
+		$this->writeAttribute('id', 'storagePopupMasterParent');
+		$this->writeAttribute('class', 'storageList');
+		$this->startElement('div');
+		$this->writeAttribute('id', 'storagePopupMasterContainer');
+		$this->endElement();
+		$this->endElement();
+		$this->startElement('div');
+		$this->writeAttribute('class', 'button_rack');
+		$this->startElement('button');
+		$this->writeAttribute('id', 'local_storage_popup_close_button');
+		$this->writeAttribute('class', 'center');
+		$this->text('Close Storage Popup');
 		$this->endElement();
 		$this->endElement();
 		$this->endElement();
@@ -326,14 +382,6 @@ catch (error) {
 		$this->writeAttribute('id', 'internal_file_clicker');
 		$this->text('Local File');
 		$this->endElement();
-		$this->startElement('li');
-		$this->writeAttribute('id', 'open_saved_clicker');
-		$this->text('Saved State');
-		$this->startElement('ul');
-		$this->writeAttribute('id', 'save_states');
-		$this->writeAttribute('class', 'menu');
-		$this->endElement();
-		$this->endElement();
 		$this->endElement();
 		$this->endElement();
 		$this->startElement('li');
@@ -345,8 +393,12 @@ catch (error) {
 		$this->text('Save Freeze State');
 		$this->endElement();
 		$this->startElement('li');
+		$this->writeAttribute('id', 'set_volume');
+		$this->text('Set Volume');
+		$this->endElement();
+		$this->startElement('li');
 		$this->writeAttribute('id', 'set_speed');
-		$this->text('Set Speed Multiplier');
+		$this->text('Set Speed');
 		$this->endElement();
 		$this->startElement('li');
 		$this->writeAttribute('id', 'restart_cpu_clicker');
@@ -371,6 +423,18 @@ catch (error) {
 		$this->startElement('li');
 		$this->writeAttribute('id', 'view_instructions');
 		$this->text('Instructions');
+		$this->endElement();
+		$this->startElement('li');
+		$this->writeAttribute('id', 'view_importer');
+		$this->text('Save Importer');
+		$this->endElement();
+		$this->startElement('li');
+		$this->writeAttribute('id', 'local_storage_list_menu');
+		$this->text('Save Manager');
+		$this->endElement();
+		$this->startElement('li');
+		$this->writeAttribute('id', 'freeze_list_menu');
+		$this->text('Freeze State Manager');
 		$this->endElement();
 		$this->startElement('li');
 		$this->writeAttribute('id', 'view_fullscreen');
@@ -398,6 +462,26 @@ catch (error) {
 		$this->endElement();
 		$this->endElement();
 	}
+	protected function saveInput() {
+		$this->startElement('div');
+		$this->writeAttribute('id', 'save_importer');
+		$this->writeAttribute('class', 'window');
+		$this->startElement('form');
+		$this->startElement('input');
+		$this->writeAttribute('type', 'file');
+		$this->writeAttribute('id', 'save_open');
+		$this->endElement();
+		$this->endElement();
+		$this->startElement('div');
+		$this->writeAttribute('class', 'button_rack');
+		$this->startElement('button');
+		$this->writeAttribute('id', 'save_importer_close_button');
+		$this->writeAttribute('class', 'center');
+		$this->text('Close Save Importer');
+		$this->endElement();
+		$this->endElement();
+		$this->endElement();
+	}
 	protected function displayInstructions() {
 		$this->startElement('div');
 		$this->writeAttribute('id', 'instructions');
@@ -409,10 +493,10 @@ catch (error) {
 		$this->endElement();
 		$this->startElement('ul');
 		$this->startElement('li');
-		$this->text('X is A.');
+		$this->text('X/J are A.');
 		$this->endElement();
 		$this->startElement('li');
-		$this->text('Z is B.');
+		$this->text('Z/Y/Q are B.');
 		$this->endElement();
 		$this->startElement('li');
 		$this->text('Shift is Select.');

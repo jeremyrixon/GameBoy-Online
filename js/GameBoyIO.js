@@ -1,29 +1,21 @@
+"use strict";
 var gameboy = null;						//GameBoyCore object.
-var gbRunInterval;						//GameBoyCore Timer
+var gbRunInterval = null;				//GameBoyCore Timer
 var settings = [						//Some settings.
 	true, 								//Turn on sound.
-	false,								//Force Mono sound.
+	true,								//Boot with boot ROM first?
 	false,								//Give priority to GameBoy mode
-	[39, 37, 38, 40, 88, 90, 16, 13],	//Keyboard button map.
-	0,									//Frameskip Amount (Auto frameskip setting allows the script to change this.)
+	1,									//Volume level set.
+	true,								//Colorize GB mode?
 	false,								//Disallow typed arrays?
-	16,									//Interval for the emulator loop.
-	false,								//Auto Frame Skip
-	29,									//Maximum Frame Skip
+	4,									//Interval for the emulator loop.
+	15,									//Audio buffer minimum span amount over x interpreter iterations.
+	30,									//Audio buffer maximum span amount over x interpreter iterations.
 	false,								//Override to allow for MBC1 instead of ROM only (compatibility for broken 3rd-party cartridges).
 	false,								//Override MBC RAM disabling and always allow reading and writing to the banks.
-	false,								//Vertical blank event availability.
-	10,									//Frameskip base factor
-	false,								//Enable the software scaling algorithm to be compiled through JIT.
-	0x40000,							//Sample Rate
-	false,								//MozBeforePaint support detected.
-	true,								//Use the GBC BIOS?
-	true,								//Colorize GB mode?
-	false,								//Render nearest-neighbor scaling in javascript?
-	false,								//Whether to display the canvas at 144x160 on fullscreen or as stretched.
-	false,								//Use the GameBoy boot ROM instead og the GameBoy Color boot ROM.
-	8,									//Audio buffer span amount over x interpreter iterations.
-	4									//Audio underrun effective buffer level over x interpreter iterations.
+	false,								//Use the GameBoy boot ROM instead of the GameBoy Color boot ROM.
+	false,								//Scale the canvas in JS, or let the browser scale the canvas?
+	true								//Use image smoothing based scaling?
 ];
 function start(canvas, ROM) {
 	clearLastEmulation();
@@ -83,21 +75,11 @@ function save() {
 	if (GameBoyEmulatorInitialized()) {
 		try {
 			var state_suffix = 0;
-			while (findValue(gameboy.name + "_" + state_suffix) != null) {
+			while (findValue("FREEZE_" + gameboy.name + "_" + state_suffix) != null) {
 				state_suffix++;
 			}
-			setValue(gameboy.name + "_" + state_suffix, gameboy.saveState());
-			if (findValue("state_names") == null) {
-				setValue("state_names", [gameboy.name + "_" + state_suffix]);
-			}
-			else {
-				var list_of_states = findValue("state_names");
-				list_of_states[list_of_states.length] = (gameboy.name + "_" + state_suffix);
-				setValue("state_names", list_of_states);
-			}
-			cout("Saved the current state as: " + gameboy.name + "_" + state_suffix, 0);
-			document.getElementById("open_saved_clicker").style.display = "block";
-			addSaveStateItem(gameboy.name + "_" + state_suffix);
+			setValue("FREEZE_" + gameboy.name + "_" + state_suffix, gameboy.saveState());
+			cout("Saved the current state as: FREEZE_" + gameboy.name + "_" + state_suffix, 0);
 		}
 		catch (error) {
 			cout("Could not save the current emulation state(\"" + error.message + "\").", 2);
@@ -114,7 +96,12 @@ function saveSRAM() {
 				var sram = gameboy.saveSRAMState();
 				if (sram.length > 0) {
 					cout("Saving the SRAM...", 0);
-					setValue("SRAM_" + gameboy.name, sram);
+					if (findValue("SRAM_" + gameboy.name) != null) {
+						//Remove the outdated storage format save:
+						cout("Deleting the old SRAM save due to outdated format.", 0);
+						deleteValue("SRAM_" + gameboy.name);
+					}
+					setValue("B64_SRAM_" + gameboy.name, arrayToBase64(sram));
 				}
 				else {
 					cout("SRAM could not be saved because it was empty.", 1);
@@ -158,7 +145,11 @@ function autoSave() {
 }
 function openSRAM(filename) {
 	try {
-		if (findValue("SRAM_" + filename) != null) {
+		if (findValue("B64_SRAM_" + filename) != null) {
+			cout("Found a previous SRAM state (Will attempt to load).", 0);
+			return base64ToArray(findValue("B64_SRAM_" + filename));
+		}
+		else if (findValue("SRAM_" + filename) != null) {
 			cout("Found a previous SRAM state (Will attempt to load).", 0);
 			return findValue("SRAM_" + filename);
 		}
@@ -202,17 +193,154 @@ function openState(filename, canvas) {
 			}
 		}
 		else {
-			cout("Could not find the save state \"" + filename + "\".", 2);
+			cout("Could not find the save state " + filename + "\".", 2);
 		}
 	}
 	catch (error) {
 		cout("Could not open the saved emulation state.", 2);
 	}
 }
+function import_save(blobData) {
+	blobData = decodeBlob(blobData);
+	if (blobData && blobData.blobs) {
+		if (blobData.blobs.length > 0) {
+			for (var index = 0; index < blobData.blobs.length; ++index) {
+				cout("Importing blob \"" + blobData.blobs[index].blobID + "\"", 0);
+				if (blobData.blobs[index].blobContent) {
+					if (blobData.blobs[index].blobID.substring(0, 5) == "SRAM_") {
+						setValue("B64_" + blobData.blobs[index].blobID, base64(blobData.blobs[index].blobContent));
+					}
+					else {
+						setValue(blobData.blobs[index].blobID, JSON.parse(blobData.blobs[index].blobContent));
+					}
+				}
+				else if (blobData.blobs[index].blobID) {
+					cout("Save file imported had blob \"" + blobData.blobs[index].blobID + "\" with no blob data interpretable.", 2);
+				}
+				else {
+					cout("Blob chunk information missing completely.", 2);
+				}
+			}
+		}
+		else {
+			cout("Could not decode the imported file.", 2);
+		}
+	}
+	else {
+		cout("Could not decode the imported file.", 2);
+	}
+}
+function generateBlob(keyName, encodedData) {
+	//Append the file format prefix:
+	var saveString = "EMULATOR_DATA";
+	var consoleID = "GameBoy";
+	//Figure out the length:
+	var totalLength = (saveString.length + 4 + (1 + consoleID.length)) + ((1 + keyName.length) + (4 + encodedData.length));
+	//Append the total length in bytes:
+	saveString += to_little_endian_dword(totalLength);
+	//Append the console ID text's length:
+	saveString += to_byte(consoleID.length);
+	//Append the console ID text:
+	saveString += consoleID;
+	//Append the blob ID:
+	saveString += to_byte(keyName.length);
+	saveString += keyName;
+	//Now append the save data:
+	saveString += to_little_endian_dword(encodedData.length);
+	saveString += encodedData;
+	return saveString;
+}
+function generateMultiBlob(blobPairs) {
+	var consoleID = "GameBoy";
+	//Figure out the initial length:
+	var totalLength = 13 + 4 + 1 + consoleID.length;
+	//Append the console ID text's length:
+	var saveString = to_byte(consoleID.length);
+	//Append the console ID text:
+	saveString += consoleID;
+	var keyName = "";
+	var encodedData = "";
+	//Now append all the blobs:
+	for (var index = 0; index < blobPairs.length; ++index) {
+		keyName = blobPairs[index][0];
+		encodedData = blobPairs[index][1];
+		//Append the blob ID:
+		saveString += to_byte(keyName.length);
+		saveString += keyName;
+		//Now append the save data:
+		saveString += to_little_endian_dword(encodedData.length);
+		saveString += encodedData;
+		//Update the total length:
+		totalLength += 1 + keyName.length + 4 + encodedData.length;
+	}
+	//Now add the prefix:
+	saveString = "EMULATOR_DATA" + to_little_endian_dword(totalLength) + saveString;
+	return saveString;
+}
+function decodeBlob(blobData) {
+	/*Format is as follows:
+		- 13 byte string "EMULATOR_DATA"
+		- 4 byte total size (including these 4 bytes).
+		- 1 byte Console type ID length
+		- Console type ID text of 8 bit size
+		blobs {
+			- 1 byte blob ID length
+			- blob ID text (Used to say what the data is (SRAM/freeze state/etc...))
+			- 4 byte blob length
+			- blob length of 32 bit size
+		}
+	*/
+	var length = blobData.length;
+	var blobProperties = {};
+	blobProperties.consoleID = null;
+	var blobsCount = -1;
+	blobProperties.blobs = [];
+	if (length > 17) {
+		if (blobData.substring(0, 13) == "EMULATOR_DATA") {
+			var length = Math.min(((blobData.charCodeAt(16) & 0xFF) << 24) | ((blobData.charCodeAt(15) & 0xFF) << 16) | ((blobData.charCodeAt(14) & 0xFF) << 8) | (blobData.charCodeAt(13) & 0xFF), length);
+			var consoleIDLength = blobData.charCodeAt(17) & 0xFF;
+			if (length > 17 + consoleIDLength) {
+				blobProperties.consoleID = blobData.substring(18, 18 + consoleIDLength);
+				var blobIDLength = 0;
+				var blobLength = 0;
+				for (var index = 18 + consoleIDLength; index < length;) {
+					blobIDLength = blobData.charCodeAt(index++) & 0xFF;
+					if (index + blobIDLength < length) {
+						blobProperties.blobs[++blobsCount] = {};
+						blobProperties.blobs[blobsCount].blobID = blobData.substring(index, index + blobIDLength);
+						index += blobIDLength;
+						if (index + 4 < length) {
+							blobLength = ((blobData.charCodeAt(index + 3) & 0xFF) << 24) | ((blobData.charCodeAt(index + 2) & 0xFF) << 16) | ((blobData.charCodeAt(index + 1) & 0xFF) << 8) | (blobData.charCodeAt(index) & 0xFF);
+							index += 4;
+							if (index + blobLength <= length) {
+								blobProperties.blobs[blobsCount].blobContent =  blobData.substring(index, index + blobLength);
+								index += blobLength;
+							}
+							else {
+								cout("Blob length check failed, blob determined to be incomplete.", 2);
+								break;
+							}
+						}
+						else {
+							cout("Blob was incomplete, bailing out.", 2);
+							break;
+						}
+					}
+					else {
+						cout("Blob was incomplete, bailing out.", 2);
+						break;
+					}
+				}
+			}
+		}
+	}
+	return blobProperties;
+}
 function matchKey(key) {	//Maps a keyboard key to a gameboy key.
 	//Order: Right, Left, Up, Down, A, B, Select, Start
-	for (var index = 0; index < settings[3].length; index++) {
-		if (settings[3][index] == key) {
+	var keymap = ["right", "left", "up", "down", "a", "b", "select", "start"];	//Keyboard button map.
+	for (var index = 0; index < keymap.length; index++) {
+		if (keymap[index] == key) {
 			return index;
 		}
 	}
@@ -224,27 +352,19 @@ function GameBoyEmulatorInitialized() {
 function GameBoyEmulatorPlaying() {
 	return ((gameboy.stopEmulator & 2) == 0);
 }
-function GameBoyKeyDown(e) {
+function GameBoyKeyDown(key) {
 	if (GameBoyEmulatorInitialized() && GameBoyEmulatorPlaying()) {
-		var keycode = matchKey(e.keyCode);
+		var keycode = matchKey(key);
 		if (keycode >= 0 && keycode < 8) {
 			gameboy.JoyPadEvent(keycode, true);
-			try {
-				e.preventDefault();
-			}
-			catch (error) { }
 		}
 	}
 }
-function GameBoyKeyUp(e) {
+function GameBoyKeyUp(key) {
 	if (GameBoyEmulatorInitialized() && GameBoyEmulatorPlaying()) {
-		var keycode = matchKey(e.keyCode);
+		var keycode = matchKey(key);
 		if (keycode >= 0 && keycode < 8) {
 			gameboy.JoyPadEvent(keycode, false);
-			try {
-				e.preventDefault();
-			}
-			catch (error) { }
 		}
 	}
 }
@@ -262,50 +382,24 @@ function GameBoyGyroSignalHandler(e) {
 		catch (error) { }
 	}
 }
-function VBlankSyncHandler() {
-	if (settings[11] && GameBoyEmulatorInitialized() && GameBoyEmulatorPlaying()) {
-		//Draw out our graphics now:
-		gameboy.dispatchDraw();
+//The emulator will call this to sort out the canvas properties for (re)initialization.
+function initNewCanvas() {
+	if (GameBoyEmulatorInitialized()) {
+		gameboy.canvas.width = gameboy.canvas.clientWidth;
+		gameboy.canvas.height = gameboy.canvas.clientHeight;
 	}
 }
-function MozVBlankSyncHandler() {
-	settings[15] = true;
-	if (settings[11] && GameBoyEmulatorInitialized() && GameBoyEmulatorPlaying()) {
-		//Draw out our graphics now:
-		gameboy.dispatchDraw();
-		try {
-			window.mozRequestAnimationFrame();
-		}
-		catch (error) {
-			try {
-				window.requestAnimationFrame();
+//Call this when resizing the canvas:
+function initNewCanvasSize() {
+	if (GameBoyEmulatorInitialized()) {
+		if (!settings[12]) {
+			if (gameboy.onscreenWidth != 160 || gameboy.onscreenHeight != 144) {
+				gameboy.initLCD();
 			}
-			catch (error) { }
 		}
-	}
-}
-function requestVBlank(canvasHandle) {
-	settings[11] = true;
-	if (!settings[15]) {
-		try {
-			window.mozRequestAnimationFrame(VBlankSyncHandler);
-		}
-		catch (e) {
-			try {
-				window.webkitRequestAnimationFrame(VBlankSyncHandler, canvasHandle);
-			}
-			catch (e) {
-				try {
-					window.msRequestAnimationFrame(VBlankSyncHandler);
-				}
-				catch (e) {
-					try {
-						window.requestAnimationFrame(VBlankSyncHandler);
-					}
-					catch (e) {
-						settings[11] = false;
-					}
-				}
+		else {
+			if (gameboy.onscreenWidth != gameboy.canvas.clientWidth || gameboy.onscreenHeight != gameboy.canvas.clientHeight) {
+				gameboy.initLCD();
 			}
 		}
 	}

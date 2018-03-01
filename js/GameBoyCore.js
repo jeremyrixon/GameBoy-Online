@@ -1,7 +1,7 @@
 "use strict";
 /* 
  * JavaScript GameBoy Color Emulator
- * Copyright (C) 2010 - 2011 Grant Galitz
+ * Copyright (C) 2010 - 2012 Grant Galitz
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -33,7 +33,6 @@ function GameBoyCore(canvas, ROMImage) {
 	this.stackPointer = 0xFFFE;					//Stack Pointer
 	this.programCounter = 0x0100;				//Program Counter
 	//Some CPU Emulation State Variables:
-	this.CPUCyclesPerIteration = 0;				//Relative CPU clocking to speed set.
 	this.CPUCyclesTotal = 0;					//Relative CPU clocking to speed set, rounded appropriately.
 	this.CPUCyclesTotalBase = 0;				//Relative CPU clocking to speed set base.
 	this.CPUCyclesTotalCurrent = 0;				//Relative CPU clocking to speed set, the directly used value.
@@ -54,6 +53,7 @@ function GameBoyCore(canvas, ROMImage) {
 	this.CPUTicks = 0;							//The number of clock cycles emulated.
 	this.doubleSpeedShifter = 0;				//GBC double speed clocking shifter.
 	this.JoyPad = 0xFF;							//Joypad State (two four-bit states actually)
+	this.CPUStopped = false;					//CPU STOP status.
 	//Main RAM, MBC RAM, GBC Main RAM, VRAM, etc.
 	this.memoryReader = [];						//Array of functions mapped to read back memory
 	this.memoryWriter = [];						//Array of functions mapped to write to memory
@@ -113,12 +113,15 @@ function GameBoyCore(canvas, ROMImage) {
 	this.highY = 127;
 	this.lowY = 127;
 	//Sound variables:
-	this.audioHandle = null;					//XAudioJS handle
-	this.numSamplesTotal = 0;					//Length of the sound buffers.
-	this.sampleSize = 0;						//Length of the sound buffer for one channel.
-	this.dutyLookup = [0.125, 0.25, 0.5, 0.75];	//Map the duty values given to ones we can work with.
-	this.currentBuffer = [];					//The audio buffer we're working on.
-	this.bufferContainAmount = 0;				//Buffer maintenance metric.
+	this.audioHandle = null;						//XAudioJS handle
+	this.numSamplesTotal = 0;						//Length of the sound buffers.
+	this.dutyLookup = [								//Map the duty values given to ones we can work with.
+		[false, false, false, false, false, false, false, true],
+		[true, false, false, false, false, false, false, true],
+		[true, false, false, false, false, true, true, true],
+		[false, true, true, true, true, true, true, false]
+	];
+	this.bufferContainAmount = 0;					//Buffer maintenance metric.
 	this.LSFR15Table = null;
 	this.LSFR7Table = null;
 	this.noiseSampleTable = null;
@@ -126,26 +129,49 @@ function GameBoyCore(canvas, ROMImage) {
 	this.soundMasterEnabled = false;			//As its name implies
 	this.channel3PCM = null;					//Channel 3 adjusted sample buffer.
 	//Vin Shit:
-	this.VinLeftChannelMasterVolume = 1;		//Computed post-mixing volume.
-	this.VinRightChannelMasterVolume = 1;		//Computed post-mixing volume.
+	this.VinLeftChannelMasterVolume = 8;		//Computed post-mixing volume.
+	this.VinRightChannelMasterVolume = 8;		//Computed post-mixing volume.
 	//Channel paths enabled:
-	this.leftChannel0 = false;
 	this.leftChannel1 = false;
 	this.leftChannel2 = false;
 	this.leftChannel3 = false;
-	this.rightChannel0 = false;
+	this.leftChannel4 = false;
 	this.rightChannel1 = false;
 	this.rightChannel2 = false;
 	this.rightChannel3 = false;
-	//Current Samples Being Computed:
-	this.currentSampleLeft = 0;
-	this.currentSampleRight = 0;
+	this.rightChannel4 = false;
+	this.audioClocksUntilNextEvent = 1;
+	this.audioClocksUntilNextEventCounter = 1;
+	//Channel output level caches:
+	this.channel1currentSampleLeft = 0;
+	this.channel1currentSampleRight = 0;
+	this.channel2currentSampleLeft = 0;
+	this.channel2currentSampleRight = 0;
+	this.channel3currentSampleLeft = 0;
+	this.channel3currentSampleRight = 0;
+	this.channel4currentSampleLeft = 0;
+	this.channel4currentSampleRight = 0;
+	this.channel1currentSampleLeftSecondary = 0;
+	this.channel1currentSampleRightSecondary = 0;
+	this.channel2currentSampleLeftSecondary = 0;
+	this.channel2currentSampleRightSecondary = 0;
+	this.channel3currentSampleLeftSecondary = 0;
+	this.channel3currentSampleRightSecondary = 0;
+	this.channel4currentSampleLeftSecondary = 0;
+	this.channel4currentSampleRightSecondary = 0;
+	this.channel1currentSampleLeftTrimary = 0;
+	this.channel1currentSampleRightTrimary = 0;
+	this.channel2currentSampleLeftTrimary = 0;
+	this.channel2currentSampleRightTrimary = 0;
+	this.mixerOutputCache = 0;
 	//Pre-multipliers to cache some calculations:
+	this.emulatorSpeed = 1;
 	this.initializeTiming();
-	this.samplesOut = 0;				//Premultiplier for audio samples per instruction.
 	//Audio generation counters:
 	this.audioTicks = 0;				//Used to sample the audio system every x CPU instructions.
 	this.audioIndex = 0;				//Used to keep alignment on audio generation.
+	this.downsampleInput = 0;
+	this.audioDestinationPosition = 0;	//Used to keep alignment on audio generation.
 	this.rollover = 0;					//Used to keep alignment on the number of samples to output (Realign from counter alias).
 	//Timing Variables
 	this.emulatorTicks = 0;				//Times for how many instructions to execute before ending the loop.
@@ -164,6 +190,9 @@ function GameBoyCore(canvas, ROMImage) {
 	this.firstIteration = dateVar.getTime();
 	this.iterations = 0;
 	this.actualScanLine = 0;			//Actual scan line...
+	this.lastUnrenderedLine = 0;		//Last rendered scan line...
+	this.queuedScanLines = 0;
+	this.totalLinesPassed = 0;
 	this.haltPostClocks = 0;			//Post-Halt clocking.
 	//ROM Cartridge Components:
 	this.cMBC1 = false;					//Does the cartridge use MBC1?
@@ -194,7 +223,7 @@ function GameBoyCore(canvas, ROMImage) {
 	this.gfxSpriteShow = false;				//Are sprites enabled?
 	this.gfxSpriteNormalHeight = true;		//Are we doing 8x8 or 8x16 sprites?
 	this.bgEnabled = true;					//Is the BG enabled?
-	this.BGPriorityEnabled = 0x1000000;		//Can we flag the BG for priority over sprites?
+	this.BGPriorityEnabled = true;			//Can we flag the BG for priority over sprites?
 	this.gfxWindowCHRBankPosition = 0;		//The current bank of the character map the window uses.
 	this.gfxBackgroundCHRBankPosition = 0;	//The current bank of the character map the BG uses.
 	this.gfxBackgroundBankOffset = 0x80;	//Fast mapping of the tile numbering/
@@ -202,20 +231,17 @@ function GameBoyCore(canvas, ROMImage) {
 	this.windowX = 0;						//Current X offset of the window.
 	this.drewBlank = 0;						//To prevent the repeating of drawing a blank screen.
 	this.drewFrame = false;					//Throttle how many draws we can do to once per iteration.
-	this.midScanlineOffset = 0;				//mid-scanline rendering offset.
+	this.midScanlineOffset = -1;			//mid-scanline rendering offset.
 	this.pixelEnd = 0;						//track the x-coord limit for line rendering (mid-scanline usage).
+	this.currentX = 0;						//The x-coord we left off at for mid-scanline rendering.
 	//BG Tile Pointer Caches:
 	this.BGCHRBank1 = null;
 	this.BGCHRBank2 = null;
 	this.BGCHRCurrentBank = null;
-	//DMG X-Coord to OAM address lookup cache:
-	this.OAMAddresses = this.ArrayPad(168, null);
 	//Tile Data Cache:
 	this.tileCache = null;
-	this.tileCacheValid = null;
 	//Palettes:
 	this.colors = [0xEFFFDE, 0xADD794, 0x529273, 0x183442];			//"Classic" GameBoy palette colors.
-	this.objColors = [0x1EFFFDE, 0x1ADD794, 0x1529273, 0x1183442];	//"Classic" GameBoy sprite palette colors.
 	this.OBJPalette = null;
 	this.BGPalette = null;
 	this.gbcOBJRawPalette = null;
@@ -235,17 +261,16 @@ function GameBoyCore(canvas, ROMImage) {
 	this.WindowLayerRender = null;		//Reference to the window rendering function.
 	this.SpriteLayerRender = null;		//Reference to the OAM rendering function.
 	this.frameBuffer = [];				//The internal frame-buffer.
-	this.completeFrame = [];			//The v-blank sync'd frame buffer.
+	this.swizzledFrame = null;			//The secondary gfx buffer that holds the converted RGBA values.
 	this.canvasBuffer = null;			//imageData handle
 	this.pixelStart = 0;				//Temp variable for holding the current working framebuffer offset.
-	this.frameCount = settings[12];		//Frame skip tracker
 	//Variables used for scaling in JS:
-	this.width = 160;
-	this.height = 144;
-	this.pixelCount = this.width * this.height;
-	this.rgbCount = this.pixelCount * 4;
-	this.widthRatio = 160 / this.width;
-	this.heightRatio = 144 / this.height;
+	this.onscreenWidth = this.offscreenWidth = 160;
+	this.onscreenHeight = this.offScreenheight = 144;
+	this.offscreenRGBCount = this.onscreenWidth * this.onscreenHeight * 4;
+	this.resizePathClear = true;
+	//Initialize the white noise cache tables ahead of time:
+	this.intializeWhiteNoise();
 }
 GameBoyCore.prototype.GBBOOTROM = [		//GB BOOT ROM
 	//Converted Neviksti's ROM dump to this array:
@@ -544,6 +569,12 @@ GameBoyCore.prototype.OPCODE = [
 				}
 				parentObj.memory[0xFF4D] &= 0xFE;					//Reset the request bit.
 			}
+			else {
+				parentObj.handleSTOP();
+			}
+		}
+		else {
+			parentObj.handleSTOP();
 		}
 	},
 	//LD DE, nn
@@ -4144,67 +4175,98 @@ GameBoyCore.prototype.saveState = function () {
 		this.fromTypedArray(this.frameBuffer),
 		this.bgEnabled,
 		this.BGPriorityEnabled,
-		this.channel1adjustedFrequencyPrep,
-		this.channel1lastSampleLookup,
-		this.channel1adjustedDuty,
+		this.channel1FrequencyTracker,
+		this.channel1FrequencyCounter,
 		this.channel1totalLength,
 		this.channel1envelopeVolume,
-		this.channel1currentVolume,
 		this.channel1envelopeType,
 		this.channel1envelopeSweeps,
+		this.channel1envelopeSweepsLast,
 		this.channel1consecutive,
 		this.channel1frequency,
-		this.channel1Fault,
+		this.channel1SweepFault,
 		this.channel1ShadowFrequency,
-		this.channel1volumeEnvTime,
-		this.channel1volumeEnvTimeLast,
 		this.channel1timeSweep,
 		this.channel1lastTimeSweep,
-		this.channel1numSweep,
+		this.channel1Swept,
 		this.channel1frequencySweepDivider,
 		this.channel1decreaseSweep,
-		this.channel2adjustedFrequencyPrep,
-		this.channel2lastSampleLookup,
-		this.channel2adjustedDuty,
+		this.channel2FrequencyTracker,
+		this.channel2FrequencyCounter,
 		this.channel2totalLength,
 		this.channel2envelopeVolume,
-		this.channel2currentVolume,
 		this.channel2envelopeType,
 		this.channel2envelopeSweeps,
+		this.channel2envelopeSweepsLast,
 		this.channel2consecutive,
 		this.channel2frequency,
-		this.channel2volumeEnvTime,
-		this.channel2volumeEnvTimeLast,
 		this.channel3canPlay,
 		this.channel3totalLength,
 		this.channel3patternType,
 		this.channel3frequency,
 		this.channel3consecutive,
 		this.fromTypedArray(this.channel3PCM),
-		this.channel3adjustedFrequencyPrep,
-		this.channel4adjustedFrequencyPrep,
+		this.channel4FrequencyPeriod,
 		this.channel4lastSampleLookup,
 		this.channel4totalLength,
 		this.channel4envelopeVolume,
 		this.channel4currentVolume,
 		this.channel4envelopeType,
 		this.channel4envelopeSweeps,
+		this.channel4envelopeSweepsLast,
 		this.channel4consecutive,
-		this.channel4volumeEnvTime,
-		this.channel4volumeEnvTimeLast,
-		this.noiseTableLength,
+		this.channel4BitRange,
 		this.soundMasterEnabled,
 		this.VinLeftChannelMasterVolume,
 		this.VinRightChannelMasterVolume,
-		this.leftChannel0,
 		this.leftChannel1,
 		this.leftChannel2,
 		this.leftChannel3,
-		this.rightChannel0,
+		this.leftChannel4,
 		this.rightChannel1,
 		this.rightChannel2,
 		this.rightChannel3,
+		this.rightChannel4,
+		this.channel1currentSampleLeft,
+		this.channel1currentSampleRight,
+		this.channel2currentSampleLeft,
+		this.channel2currentSampleRight,
+		this.channel3currentSampleLeft,
+		this.channel3currentSampleRight,
+		this.channel4currentSampleLeft,
+		this.channel4currentSampleRight,
+		this.channel1currentSampleLeftSecondary,
+		this.channel1currentSampleRightSecondary,
+		this.channel2currentSampleLeftSecondary,
+		this.channel2currentSampleRightSecondary,
+		this.channel3currentSampleLeftSecondary,
+		this.channel3currentSampleRightSecondary,
+		this.channel4currentSampleLeftSecondary,
+		this.channel4currentSampleRightSecondary,
+		this.channel1currentSampleLeftTrimary,
+		this.channel1currentSampleRightTrimary,
+		this.channel2currentSampleLeftTrimary,
+		this.channel2currentSampleRightTrimary,
+		this.mixerOutputCache,
+		this.channel1DutyTracker,
+		this.channel1CachedDuty,
+		this.channel2DutyTracker,
+		this.channel2CachedDuty,
+		this.channel1Enabled,
+		this.channel2Enabled,
+		this.channel3Enabled,
+		this.channel4Enabled,
+		this.sequencerClocks,
+		this.sequencePosition,
+		this.channel3Counter,
+		this.channel4Counter,
+		this.cachedChannel3Sample,
+		this.cachedChannel4Sample,
+		this.channel3FrequencyPeriod,
+		this.channel3lastSampleLookup,
 		this.actualScanLine,
+		this.lastUnrenderedLine,
+		this.queuedScanLines,
 		this.RTCisLatched,
 		this.latchedSeconds,
 		this.latchedMinutes,
@@ -4224,7 +4286,6 @@ GameBoyCore.prototype.saveState = function () {
 		this.numRAMBanks,
 		this.windowY,
 		this.windowX,
-		this.returnOAMXCacheCopy(this.OAMAddresses),
 		this.fromTypedArray(this.gbcOBJRawPalette),
 		this.fromTypedArray(this.gbcBGRawPalette),
 		this.fromTypedArray(this.gbOBJPalette),
@@ -4243,13 +4304,17 @@ GameBoyCore.prototype.saveState = function () {
 		this.remainingClocks,
 		this.colorizedGBPalettes,
 		this.backgroundY,
-		this.backgroundX
+		this.backgroundX,
+		this.CPUStopped,
+		this.audioClocksUntilNextEvent,
+		this.audioClocksUntilNextEventCounter
 	];
 }
 GameBoyCore.prototype.returnFromState = function (returnedFrom) {
 	var index = 0;
 	var state = returnedFrom.slice(0);
 	this.ROM = this.toTypedArray(state[index++], "uint8");
+	this.ROMBankEdge = Math.floor(this.ROM.length / 0x4000);
 	this.inBootstrap = state[index++];
 	this.registerA = state[index++];
 	this.FZero = state[index++];
@@ -4323,67 +4388,98 @@ GameBoyCore.prototype.returnFromState = function (returnedFrom) {
 	this.frameBuffer = this.toTypedArray(state[index++], "int32");
 	this.bgEnabled = state[index++];
 	this.BGPriorityEnabled = state[index++];
-	this.channel1adjustedFrequencyPrep = state[index++];
-	this.channel1lastSampleLookup = state[index++];
-	this.channel1adjustedDuty = state[index++];
+	this.channel1FrequencyTracker = state[index++];
+	this.channel1FrequencyCounter = state[index++];
 	this.channel1totalLength = state[index++];
 	this.channel1envelopeVolume = state[index++];
-	this.channel1currentVolume = state[index++];
 	this.channel1envelopeType = state[index++];
 	this.channel1envelopeSweeps = state[index++];
+	this.channel1envelopeSweepsLast = state[index++];
 	this.channel1consecutive = state[index++];
 	this.channel1frequency = state[index++];
-	this.channel1Fault = state[index++];
+	this.channel1SweepFault = state[index++];
 	this.channel1ShadowFrequency = state[index++];
-	this.channel1volumeEnvTime = state[index++];
-	this.channel1volumeEnvTimeLast = state[index++];
 	this.channel1timeSweep = state[index++];
 	this.channel1lastTimeSweep = state[index++];
-	this.channel1numSweep = state[index++];
+	this.channel1Swept = state[index++];
 	this.channel1frequencySweepDivider = state[index++];
 	this.channel1decreaseSweep = state[index++];
-	this.channel2adjustedFrequencyPrep = state[index++];
-	this.channel2lastSampleLookup = state[index++];
-	this.channel2adjustedDuty = state[index++];
+	this.channel2FrequencyTracker = state[index++];
+	this.channel2FrequencyCounter = state[index++];
 	this.channel2totalLength = state[index++];
 	this.channel2envelopeVolume = state[index++];
-	this.channel2currentVolume = state[index++];
 	this.channel2envelopeType = state[index++];
 	this.channel2envelopeSweeps = state[index++];
+	this.channel2envelopeSweepsLast = state[index++];
 	this.channel2consecutive = state[index++];
 	this.channel2frequency = state[index++];
-	this.channel2volumeEnvTime = state[index++];
-	this.channel2volumeEnvTimeLast = state[index++];
 	this.channel3canPlay = state[index++];
 	this.channel3totalLength = state[index++];
 	this.channel3patternType = state[index++];
 	this.channel3frequency = state[index++];
 	this.channel3consecutive = state[index++];
-	this.channel3PCM = this.toTypedArray(state[index++], "float32");
-	this.channel3adjustedFrequencyPrep = state[index++];
-	this.channel4adjustedFrequencyPrep = state[index++];
+	this.channel3PCM = this.toTypedArray(state[index++], "int8");
+	this.channel4FrequencyPeriod = state[index++];
 	this.channel4lastSampleLookup = state[index++];
 	this.channel4totalLength = state[index++];
 	this.channel4envelopeVolume = state[index++];
 	this.channel4currentVolume = state[index++];
 	this.channel4envelopeType = state[index++];
 	this.channel4envelopeSweeps = state[index++];
+	this.channel4envelopeSweepsLast = state[index++];
 	this.channel4consecutive = state[index++];
-	this.channel4volumeEnvTime = state[index++];
-	this.channel4volumeEnvTimeLast = state[index++];
-	this.noiseTableLength = state[index++];
+	this.channel4BitRange = state[index++];
 	this.soundMasterEnabled = state[index++];
 	this.VinLeftChannelMasterVolume = state[index++];
 	this.VinRightChannelMasterVolume = state[index++];
-	this.leftChannel0 = state[index++];
 	this.leftChannel1 = state[index++];
 	this.leftChannel2 = state[index++];
 	this.leftChannel3 = state[index++];
-	this.rightChannel0 = state[index++];
+	this.leftChannel4 = state[index++];
 	this.rightChannel1 = state[index++];
 	this.rightChannel2 = state[index++];
 	this.rightChannel3 = state[index++];
+	this.rightChannel4 = state[index++];
+	this.channel1currentSampleLeft = state[index++];
+	this.channel1currentSampleRight = state[index++];
+	this.channel2currentSampleLeft = state[index++];
+	this.channel2currentSampleRight = state[index++];
+	this.channel3currentSampleLeft = state[index++];
+	this.channel3currentSampleRight = state[index++];
+	this.channel4currentSampleLeft = state[index++];
+	this.channel4currentSampleRight = state[index++];
+	this.channel1currentSampleLeftSecondary = state[index++];
+	this.channel1currentSampleRightSecondary = state[index++];
+	this.channel2currentSampleLeftSecondary = state[index++];
+	this.channel2currentSampleRightSecondary = state[index++];
+	this.channel3currentSampleLeftSecondary = state[index++];
+	this.channel3currentSampleRightSecondary = state[index++];
+	this.channel4currentSampleLeftSecondary = state[index++];
+	this.channel4currentSampleRightSecondary = state[index++];
+	this.channel1currentSampleLeftTrimary = state[index++];
+	this.channel1currentSampleRightTrimary = state[index++];
+	this.channel2currentSampleLeftTrimary = state[index++];
+	this.channel2currentSampleRightTrimary = state[index++];
+	this.mixerOutputCache = state[index++];
+	this.channel1DutyTracker = state[index++];
+	this.channel1CachedDuty = state[index++];
+	this.channel2DutyTracker = state[index++];
+	this.channel2CachedDuty = state[index++];
+	this.channel1Enabled = state[index++];
+	this.channel2Enabled = state[index++];
+	this.channel3Enabled = state[index++];
+	this.channel4Enabled = state[index++];
+	this.sequencerClocks = state[index++];
+	this.sequencePosition = state[index++];
+	this.channel3Counter = state[index++];
+	this.channel4Counter = state[index++];
+	this.cachedChannel3Sample = state[index++];
+	this.cachedChannel4Sample = state[index++];
+	this.channel3FrequencyPeriod = state[index++];
+	this.channel3lastSampleLookup = state[index++];
 	this.actualScanLine = state[index++];
+	this.lastUnrenderedLine = state[index++];
+	this.queuedScanLines = state[index++];
 	this.RTCisLatched = state[index++];
 	this.latchedSeconds = state[index++];
 	this.latchedMinutes = state[index++];
@@ -4403,7 +4499,6 @@ GameBoyCore.prototype.returnFromState = function (returnedFrom) {
 	this.numRAMBanks = state[index++];
 	this.windowY = state[index++];
 	this.windowX = state[index++];
-	this.OAMAddresses = this.returnOAMXCacheCopy(state[index++]);
 	this.gbcOBJRawPalette = this.toTypedArray(state[index++], "uint8");
 	this.gbcBGRawPalette = this.toTypedArray(state[index++], "uint8");
 	this.gbOBJPalette = this.toTypedArray(state[index++], "int32");
@@ -4423,7 +4518,10 @@ GameBoyCore.prototype.returnFromState = function (returnedFrom) {
 	this.remainingClocks = state[index++];
 	this.colorizedGBPalettes = state[index++];
 	this.backgroundY = state[index++];
-	this.backgroundX = state[index];
+	this.backgroundX = state[index++];
+	this.CPUStopped = state[index++];
+	this.audioClocksUntilNextEvent = state[index++];
+	this.audioClocksUntilNextEventCounter = state[index];
 	this.fromSaveState = true;
 	this.TICKTable = this.toTypedArray(this.TICKTable, "uint8");
 	this.SecondaryTICKTable = this.toTypedArray(this.SecondaryTICKTable, "uint8");
@@ -4432,9 +4530,8 @@ GameBoyCore.prototype.returnFromState = function (returnedFrom) {
 	this.memoryWriteJumpCompile();
 	this.initLCD();
 	this.initSound();
-	this.noiseSampleTable = (this.noiseTableLength == 0x8000) ? this.LSFR15Table : this.LSFR7Table;
-	this.channel4VolumeShifter = (this.noiseTableLength == 0x8000) ? 15 : 7;
-	this.drawToCanvas();
+	this.noiseSampleTable = (this.channel4BitRange == 0x7FFF) ? this.LSFR15Table : this.LSFR7Table;
+	this.channel4VolumeShifter = (this.channel4BitRange == 0x7FFF) ? 15 : 7;
 }
 GameBoyCore.prototype.returnFromRTCState = function () {
 	if (typeof this.openRTC == "function" && this.cTIMER) {
@@ -4456,7 +4553,6 @@ GameBoyCore.prototype.returnFromRTCState = function () {
 	}
 }
 GameBoyCore.prototype.start = function () {
-	settings[4] = 0;	//Reset the frame skip setting.
 	this.initMemory();	//Write the startup memory.
 	this.ROMLoad();		//Load the ROM into memory and get cartridge information from it.
 	this.initLCD();		//Initialize the graphics.
@@ -4470,7 +4566,7 @@ GameBoyCore.prototype.initMemory = function () {
 	this.BGCHRBank1 = this.getTypedArray(0x800, 0, "uint8");
 	this.TICKTable = this.toTypedArray(this.TICKTable, "uint8");
 	this.SecondaryTICKTable = this.toTypedArray(this.SecondaryTICKTable, "uint8");
-	this.channel3PCM = this.getTypedArray(0x60, 0, "float32");
+	this.channel3PCM = this.getTypedArray(0x20, 0, "int8");
 }
 GameBoyCore.prototype.generateCacheArray = function (tileAmount) {
 	var tileArray = [];
@@ -4542,67 +4638,66 @@ GameBoyCore.prototype.initSkipBootstrap = function () {
 	this.mode1TriggerSTAT = false;
 	this.mode0TriggerSTAT = false;
 	this.LCDisOn = true;
-	this.channel1adjustedFrequencyPrep = 0.008126984126984127;
-	this.channel1adjustedDuty = 0.5;
+	this.channel1FrequencyTracker = 0x2000;
+	this.channel1DutyTracker = 0;
+	this.channel1CachedDuty = this.dutyLookup[2];
 	this.channel1totalLength = 0;
 	this.channel1envelopeVolume = 0;
-	this.channel1currentVolume = 0;
 	this.channel1envelopeType = false;
 	this.channel1envelopeSweeps = 0;
+	this.channel1envelopeSweepsLast = 0;
 	this.channel1consecutive = true;
 	this.channel1frequency = 1985;
-	this.channel1Fault = 0;
+	this.channel1SweepFault = true;
 	this.channel1ShadowFrequency = 1985;
-	this.channel1volumeEnvTime = 0;
-	this.channel1volumeEnvTimeLast = 12000;
-	this.channel1timeSweep = 0;
+	this.channel1timeSweep = 1;
 	this.channel1lastTimeSweep = 0;
-	this.channel1numSweep = 0;
+	this.channel1Swept = false;
 	this.channel1frequencySweepDivider = 0;
 	this.channel1decreaseSweep = false;
-	this.channel2adjustedFrequencyPrep = 0;
-	this.channel2adjustedDuty = 0.5;
+	this.channel2FrequencyTracker = 0x2000;
+	this.channel2DutyTracker = 0;
+	this.channel2CachedDuty = this.dutyLookup[2];
 	this.channel2totalLength = 0;
 	this.channel2envelopeVolume = 0;
-	this.channel2currentVolume = 0;
 	this.channel2envelopeType = false;
 	this.channel2envelopeSweeps = 0;
+	this.channel2envelopeSweepsLast = 0;
 	this.channel2consecutive = true;
 	this.channel2frequency = 0;
-	this.channel2volumeEnvTime = 0;
-	this.channel2volumeEnvTimeLast = 0;
 	this.channel3canPlay = false;
 	this.channel3totalLength = 0;
-	this.channel3patternType = -32;
+	this.channel3patternType = 4;
 	this.channel3frequency = 0;
 	this.channel3consecutive = true;
-	this.channel3adjustedFrequencyPrep = 0.512;
-	this.channel4adjustedFrequencyPrep = 0;
+	this.channel3Counter = 0x418;
+	this.channel4FrequencyPeriod = 8;
 	this.channel4totalLength = 0;
 	this.channel4envelopeVolume = 0;
 	this.channel4currentVolume = 0;
 	this.channel4envelopeType = false;
 	this.channel4envelopeSweeps = 0;
+	this.channel4envelopeSweepsLast = 0;
 	this.channel4consecutive = true;
-	this.channel4volumeEnvTime = 0;
-	this.channel4volumeEnvTimeLast = 0;
-	this.noiseTableLength = 0x8000;
+	this.channel4BitRange = 0x7FFF;
 	this.channel4VolumeShifter = 15;
-	this.channel1lastSampleLookup = 0.7169351111064097;
-	this.channel2lastSampleLookup = 0;
-	this.channel3Tracker = 0;
+	this.channel1FrequencyCounter = 0x200;
+	this.channel2FrequencyCounter = 0x200;
+	this.channel3Counter = 0x800;
+	this.channel3FrequencyPeriod = 0x800;
+	this.channel3lastSampleLookup = 0;
 	this.channel4lastSampleLookup = 0;
 	this.VinLeftChannelMasterVolume = 1;
 	this.VinRightChannelMasterVolume = 1;
 	this.soundMasterEnabled = true;
-	this.leftChannel0 = true;
 	this.leftChannel1 = true;
 	this.leftChannel2 = true;
 	this.leftChannel3 = true;
-	this.rightChannel0 = true;
+	this.leftChannel4 = true;
 	this.rightChannel1 = true;
-	this.rightChannel2 = false;
+	this.rightChannel2 = true;
 	this.rightChannel3 = false;
+	this.rightChannel4 = false;
 	this.DIVTicks = 27044;
 	this.LCDTicks = 160;
 	this.timerTicks = 0;
@@ -4613,18 +4708,18 @@ GameBoyCore.prototype.initSkipBootstrap = function () {
 	this.serialShiftTimerAllocated = 0;
 	this.IRQEnableDelay = 0;
 	this.actualScanLine = 144;
+	this.lastUnrenderedLine = 0;
 	this.gfxWindowDisplay = false;
 	this.gfxSpriteShow = false;
 	this.gfxSpriteNormalHeight = true;
 	this.bgEnabled = true;
-	this.BGPriorityEnabled = 0x1000000;
+	this.BGPriorityEnabled = true;
 	this.gfxWindowCHRBankPosition = 0;
 	this.gfxBackgroundCHRBankPosition = 0;
 	this.gfxBackgroundBankOffset = 0;
 	this.windowY = 0;
 	this.windowX = 0;
 	this.drewBlank = 0;
-	this.drewFrame = true;
 	this.midScanlineOffset = -1;
 	this.currentX = 0;
 }
@@ -4643,25 +4738,24 @@ GameBoyCore.prototype.initBootstrap = function () {
 	this.registerE = 0;
 	this.FZero = this.FSubtract = this.FHalfCarry = this.FCarry = false;
 	this.registersHL = 0;
-	this.leftChannel0 = false;
 	this.leftChannel1 = false;
 	this.leftChannel2 = false;
 	this.leftChannel3 = false;
-	this.rightChannel0 = false;
+	this.leftChannel4 = false;
 	this.rightChannel1 = false;
 	this.rightChannel2 = false;
 	this.rightChannel3 = false;
+	this.rightChannel4 = false;
 	this.channel2frequency = this.channel1frequency = 0;
-	this.channel2volumeEnvTime = this.channel1volumeEnvTime = 0;
 	this.channel4consecutive = this.channel2consecutive = this.channel1consecutive = false;
-	this.VinLeftChannelMasterVolume = 1;
-	this.VinRightChannelMasterVolume = 1;
+	this.VinLeftChannelMasterVolume = 8;
+	this.VinRightChannelMasterVolume = 8;
 	this.memory[0xFF00] = 0xF;	//Set the joypad state.
 }
 GameBoyCore.prototype.ROMLoad = function () {
 	//Load the first two ROM banks (0x0000 - 0x7FFF) into regular gameboy memory:
 	this.ROM = [];
-	this.usedBootROM = settings[16];
+	this.usedBootROM = settings[1];
 	var maxLength = this.ROMImage.length;
 	if (maxLength < 0x4000) {
 		throw(new Error("ROM image size too small."));
@@ -4669,7 +4763,7 @@ GameBoyCore.prototype.ROMLoad = function () {
 	this.ROM = this.getTypedArray(maxLength, 0, "uint8");
 	var romIndex = 0;
 	if (this.usedBootROM) {
-		if (!settings[20]) {
+		if (!settings[11]) {
 			//Patch in the GBC boot ROM into the memory map:
 			for (; romIndex < 0x100; ++romIndex) {
 				this.memory[romIndex] = this.GBCBOOTROM[romIndex];											//Load in the GameBoy Color BOOT ROM.
@@ -4705,6 +4799,7 @@ GameBoyCore.prototype.ROMLoad = function () {
 	for (; romIndex < maxLength; ++romIndex) {
 		this.ROM[romIndex] = (this.ROMImage.charCodeAt(romIndex) & 0xFF);
 	}
+	this.ROMBankEdge = Math.floor(this.ROM.length / 0x4000);
 	//Set up the emulator for the cartidge specifics:
 	this.interpretCartridge();
 	//Check for IRQ matching upon initialization:
@@ -4976,23 +5071,18 @@ GameBoyCore.prototype.disableBootROM = function () {
 }
 GameBoyCore.prototype.initializeTiming = function () {
 	//Emulator Timing:
-	this.baseCPUCyclesPerIteration = 0x80000 / 0x7D * settings[6];
-	this.setEmulatorSpeed(1);
-}
-GameBoyCore.prototype.setEmulatorSpeed = function(speed) {
-	this.CPUCyclesPerIteration = this.baseCPUCyclesPerIteration * speed;
-	this.CPUCyclesTotalRoundoff = this.CPUCyclesPerIteration % 4;
-	this.CPUCyclesTotalBase = this.CPUCyclesTotal = (this.CPUCyclesPerIteration - this.CPUCyclesTotalRoundoff) | 0;
+	this.clocksPerSecond = this.emulatorSpeed * 0x400000;
+	this.baseCPUCyclesPerIteration = this.clocksPerSecond / 1000 * settings[6];
+	this.CPUCyclesTotalRoundoff = this.baseCPUCyclesPerIteration % 4;
+	this.CPUCyclesTotalBase = this.CPUCyclesTotal = (this.baseCPUCyclesPerIteration - this.CPUCyclesTotalRoundoff) | 0;
 	this.CPUCyclesTotalCurrent = 0;
-	this.setAudioSpeed(speed);
 }
-GameBoyCore.prototype.setAudioSpeed = function (speed) {
-	this.preChewedAudioComputationMultiplier = 0x20000 / settings[14];
-	this.preChewedWAVEAudioComputationMultiplier = 0x200000 / settings[14];
-	this.whiteNoiseFrequencyPreMultiplier = 0x80000 / settings[14];
-	this.volumeEnvelopePreMultiplier = settings[14] / 0x40 / speed;
-	this.channel1TimeSweepPreMultiplier = settings[14] / 0x80 / speed;
-	this.audioTotalLengthMultiplier = settings[14] / 0x100 / speed;
+GameBoyCore.prototype.setSpeed = function (speed) {
+	this.emulatorSpeed = speed;
+	this.initializeTiming();
+	if (this.audioHandle) {
+		this.initSound();
+	}
 }
 GameBoyCore.prototype.setupRAM = function () {
 	//Setup the auxilliary/switchable RAM:
@@ -5030,9 +5120,6 @@ GameBoyCore.prototype.setupRAM = function () {
 		this.VRAM = this.getTypedArray(0x2000, 0, "uint8");
 		this.GBCMemory = this.getTypedArray(0x7000, 0, "uint8");
 	}
-	else {
-		this.resetOAMXCache();
-	}
 	this.memoryReadJumpCompile();
 	this.memoryWriteJumpCompile();
 }
@@ -5040,53 +5127,98 @@ GameBoyCore.prototype.MBCRAMUtilized = function () {
 	return this.cMBC1 || this.cMBC2 || this.cMBC3 || this.cMBC5 || this.cMBC7 || this.cRUMBLE;
 }
 GameBoyCore.prototype.recomputeDimension = function () {
+	initNewCanvas();
 	//Cache some dimension info:
-	this.pixelCount = this.width * this.height;
-	this.rgbCount = this.pixelCount * 4;
-	this.widthRatio = 160 / this.width;
-	this.heightRatio = 144 / this.height;
+	this.onscreenWidth = this.canvas.width;
+	this.onscreenHeight = this.canvas.height;
+	if (window && window.mozRequestAnimationFrame) {
+		//Firefox slowness hack:
+		this.canvas.width = this.onscreenWidth = (!settings[12]) ? 160 : this.canvas.width;
+		this.canvas.height = this.onscreenHeight = (!settings[12]) ? 144 : this.canvas.height;
+	}
+	else {
+		this.onscreenWidth = this.canvas.width;
+		this.onscreenHeight = this.canvas.height;
+	}
+	this.offscreenWidth = (!settings[12]) ? 160 : this.canvas.width;
+	this.offscreenHeight = (!settings[12]) ? 144 : this.canvas.height;
+	this.offscreenRGBCount = this.offscreenWidth * this.offscreenHeight * 4;
 }
 GameBoyCore.prototype.initLCD = function () {
 	this.recomputeDimension();
-	this.completeFrame = this.getTypedArray(this.pixelCount, 0, "int32");	//Used for double-buffering and the target for software-side rescaling.
-	this.compileResizeFrameBufferFunction();
+	if (this.offscreenRGBCount != 92160) {
+		//Only create the resizer handle if we need it:
+		this.compileResizeFrameBufferFunction();
+	}
+	else {
+		//Resizer not needed:
+		this.resizer = null;
+	}
 	try {
-		this.drawContext = this.canvas.getContext("2d");
+		this.canvasOffscreen = document.createElement("canvas");
+		this.canvasOffscreen.width = this.offscreenWidth;
+		this.canvasOffscreen.height = this.offscreenHeight;
+		this.drawContextOffscreen = this.canvasOffscreen.getContext("2d");
+		this.drawContextOnscreen = this.canvas.getContext("2d");
+		this.canvas.setAttribute("style", (this.canvas.getAttribute("style") || "") + "; image-rendering: " + ((settings[13]) ? "auto" : "-webkit-optimize-contrast") + ";" + 
+		"image-rendering: " + ((settings[13]) ? "optimizeQuality" : "-o-crisp-edges") + ";" +
+		"image-rendering: " + ((settings[13]) ? "optimizeQuality" : "-moz-crisp-edges") + ";" +
+		"-ms-interpolation-mode: " + ((settings[13]) ? "bicubic" : "nearest-neighbor") + ";");
+		this.drawContextOffscreen.webkitImageSmoothingEnabled  = settings[13];
+		this.drawContextOffscreen.mozImageSmoothingEnabled = settings[13];
+		this.drawContextOnscreen.webkitImageSmoothingEnabled  = settings[13];
+		this.drawContextOnscreen.mozImageSmoothingEnabled = settings[13];
 		//Get a CanvasPixelArray buffer:
 		try {
-			this.canvasBuffer = this.drawContext.createImageData(this.width, this.height);
+			this.canvasBuffer = this.drawContextOffscreen.createImageData(this.offscreenWidth, this.offscreenHeight);
 		}
 		catch (error) {
 			cout("Falling back to the getImageData initialization (Error \"" + error.message + "\").", 1);
-			this.canvasBuffer = this.drawContext.getImageData(0, 0, this.width, this.height);
+			this.canvasBuffer = this.drawContextOffscreen.getImageData(0, 0, this.offscreenWidth, this.offscreenHeight);
 		}
-		var index = this.rgbCount;
+		var index = this.offscreenRGBCount;
 		while (index > 0) {
 			this.canvasBuffer.data[index -= 4] = 0xF8;
 			this.canvasBuffer.data[index + 1] = 0xF8;
 			this.canvasBuffer.data[index + 2] = 0xF8;
 			this.canvasBuffer.data[index + 3] = 0xFF;
 		}
-		this.drawContext.putImageData(this.canvasBuffer, 0, 0);		//Throws any browser that won't support this later on.
+		this.graphicsBlit();
 		this.canvas.style.visibility = "visible";
-		this.prepareFrame();
+		if (this.swizzledFrame == null) {
+			this.swizzledFrame = this.getTypedArray(69120, 0xFF, "uint8");
+		}
+		//Test the draw system and browser vblank latching:
+		this.drewFrame = true;										//Copy the latest graphics to buffer.
+		this.requestDraw();
 	}
 	catch (error) {
-		throw(new Error("HTML5 Canvas support required."));
+		throw(new Error("HTML5 Canvas support required: " + error.message + "file: " + error.fileName + ", line: " + error.lineNumber));
+	}
+}
+GameBoyCore.prototype.graphicsBlit = function () {
+	if (this.offscreenWidth == this.onscreenWidth && this.offscreenHeight == this.onscreenHeight) {
+		this.drawContextOnscreen.putImageData(this.canvasBuffer, 0, 0);
+	}
+	else {
+		this.drawContextOffscreen.putImageData(this.canvasBuffer, 0, 0);
+		this.drawContextOnscreen.drawImage(this.canvasOffscreen, 0, 0, this.onscreenWidth, this.onscreenHeight);
 	}
 }
 GameBoyCore.prototype.JoyPadEvent = function (key, down) {
 	if (down) {
 		this.JoyPad &= 0xFF ^ (1 << key);
-		/*if (!this.cGBC) {
+		if (!this.cGBC && (!this.usedBootROM || !this.usedGBCBootROM)) {
 			this.interruptsRequested |= 0x10;	//A real GBC doesn't set this!
+			this.remainingClocks = 0;
 			this.checkIRQMatching();
-		}*/
+		}
 	}
 	else {
 		this.JoyPad |= (1 << key);
 	}
 	this.memory[0xFF00] = (this.memory[0xFF00] & 0x30) + ((((this.memory[0xFF00] & 0x20) == 0) ? (this.JoyPad >> 4) : 0xF) & (((this.memory[0xFF00] & 0x10) == 0) ? (this.JoyPad & 0xF) : 0xF));
+	this.CPUStopped = false;
 }
 GameBoyCore.prototype.GyroEvent = function (x, y) {
 	x *= -100;
@@ -5099,578 +5231,673 @@ GameBoyCore.prototype.GyroEvent = function (x, y) {
 	this.lowY = y & 0xFF;
 }
 GameBoyCore.prototype.initSound = function () {
+	this.audioResamplerFirstPassFactor = Math.max(Math.min(Math.floor(this.clocksPerSecond / 44100), Math.floor(0xFFFF / 0x1E0)), 1);
+	this.downSampleInputDivider = 1 / (this.audioResamplerFirstPassFactor * 0xF0);
 	if (settings[0]) {
-		this.soundChannelsAllocated = (!settings[1]) ? 2 : 1;
-		this.soundFrameShifter = this.soundChannelsAllocated - 1;
-		try {
-			var parentObj = this;
-			this.sampleSize = settings[14] / 1000 * settings[6];
-			this.audioHandle = new XAudioServer(this.soundChannelsAllocated, settings[14], Math.max(this.sampleSize * settings[22], 2048) << this.soundFrameShifter, Math.max(this.sampleSize * 20, 8192) << this.soundFrameShifter, function (sampleCount) {
-				return parentObj.audioUnderRun(sampleCount);
-			}, -1);
-			cout("...Audio Channels: " + this.soundChannelsAllocated, 0);
-			cout("...Sample Rate: " + settings[14], 0);
-			this.initAudioBuffer();
-		}
-		catch (error) {
-			cout("Audio system cannot run: " + error.message, 2);
+		this.audioHandle = new XAudioServer(2, this.clocksPerSecond / this.audioResamplerFirstPassFactor, 0, Math.max(this.baseCPUCyclesPerIteration * settings[8] / this.audioResamplerFirstPassFactor, 8192) << 1, null, settings[3], function () {
 			settings[0] = false;
-		}
+		});
+		this.initAudioBuffer();
 	}
 	else if (this.audioHandle) {
-		//Neutralize the audio output:
+		//Mute the audio output, as it has an immediate silencing effect:
 		try {
-			this.audioHandle = new XAudioServer(1, 1000, 5000, 20000, function (sampleCount) {
-				return [];
-			}, 0);
+			this.audioHandle.changeVolume(0);
+		}
+		catch (error) { }
+	}
+}
+GameBoyCore.prototype.changeVolume = function () {
+	if (settings[0] && this.audioHandle) {
+		try {
+			this.audioHandle.changeVolume(settings[3]);
 		}
 		catch (error) { }
 	}
 }
 GameBoyCore.prototype.initAudioBuffer = function () {
-	this.audioTicks = this.audioIndex = 0;
-	this.bufferContainAmount = Math.max(this.sampleSize * settings[21], 4096) << this.soundFrameShifter;
-	cout("...Samples per interpreter loop iteration (Per Channel): " + this.sampleSize, 0);
-	this.samplesOut = this.sampleSize / this.CPUCyclesPerIteration;
-	cout("...Samples per clock cycle (Per Channel): " + this.samplesOut, 0);
-	this.numSamplesTotal = this.sampleSize << this.soundFrameShifter;
-	this.currentBuffer = this.getTypedArray(this.numSamplesTotal, -1, "float32");
-	this.intializeWhiteNoise();
+	this.audioIndex = 0;
+	this.audioDestinationPosition = 0;
+	this.downsampleInput = 0;
+	this.bufferContainAmount = Math.max(this.baseCPUCyclesPerIteration * settings[7] / this.audioResamplerFirstPassFactor, 4096) << 1;
+	this.numSamplesTotal = (this.baseCPUCyclesPerIteration / this.audioResamplerFirstPassFactor) << 1;
+	this.audioBuffer = this.getTypedArray(this.numSamplesTotal, 0, "float32");
 }
 GameBoyCore.prototype.intializeWhiteNoise = function () {
 	//Noise Sample Tables:
 	var randomFactor = 1;
 	//15-bit LSFR Cache Generation:
-	this.LSFR15Table = this.getTypedArray(0x80000, 0, "float32");
+	this.LSFR15Table = this.getTypedArray(0x80000, 0, "int8");
 	var LSFR = 0x7FFF;	//Seed value has all its bits set.
 	var LSFRShifted = 0x3FFF;
 	for (var index = 0; index < 0x8000; ++index) {
 		//Normalize the last LSFR value for usage:
 		randomFactor = 1 - (LSFR & 1);	//Docs say it's the inverse.
 		//Cache the different volume level results:
-		this.LSFR15Table[0x08000 | index] = randomFactor * 0x1 / 0x1E;
-		this.LSFR15Table[0x10000 | index] = randomFactor * 0x2 / 0x1E;
-		this.LSFR15Table[0x18000 | index] = randomFactor * 0x3 / 0x1E;
-		this.LSFR15Table[0x20000 | index] = randomFactor * 0x4 / 0x1E;
-		this.LSFR15Table[0x28000 | index] = randomFactor * 0x5 / 0x1E;
-		this.LSFR15Table[0x30000 | index] = randomFactor * 0x6 / 0x1E;
-		this.LSFR15Table[0x38000 | index] = randomFactor * 0x7 / 0x1E;
-		this.LSFR15Table[0x40000 | index] = randomFactor * 0x8 / 0x1E;
-		this.LSFR15Table[0x48000 | index] = randomFactor * 0x9 / 0x1E;
-		this.LSFR15Table[0x50000 | index] = randomFactor * 0xA / 0x1E;
-		this.LSFR15Table[0x58000 | index] = randomFactor * 0xB / 0x1E;
-		this.LSFR15Table[0x60000 | index] = randomFactor * 0xC / 0x1E;
-		this.LSFR15Table[0x68000 | index] = randomFactor * 0xD / 0x1E;
-		this.LSFR15Table[0x70000 | index] = randomFactor * 0xE / 0x1E;
-		this.LSFR15Table[0x78000 | index] = randomFactor / 2;
+		this.LSFR15Table[0x08000 | index] = randomFactor;
+		this.LSFR15Table[0x10000 | index] = randomFactor * 0x2;
+		this.LSFR15Table[0x18000 | index] = randomFactor * 0x3;
+		this.LSFR15Table[0x20000 | index] = randomFactor * 0x4;
+		this.LSFR15Table[0x28000 | index] = randomFactor * 0x5;
+		this.LSFR15Table[0x30000 | index] = randomFactor * 0x6;
+		this.LSFR15Table[0x38000 | index] = randomFactor * 0x7;
+		this.LSFR15Table[0x40000 | index] = randomFactor * 0x8;
+		this.LSFR15Table[0x48000 | index] = randomFactor * 0x9;
+		this.LSFR15Table[0x50000 | index] = randomFactor * 0xA;
+		this.LSFR15Table[0x58000 | index] = randomFactor * 0xB;
+		this.LSFR15Table[0x60000 | index] = randomFactor * 0xC;
+		this.LSFR15Table[0x68000 | index] = randomFactor * 0xD;
+		this.LSFR15Table[0x70000 | index] = randomFactor * 0xE;
+		this.LSFR15Table[0x78000 | index] = randomFactor * 0xF;
 		//Recompute the LSFR algorithm:
 		LSFRShifted = LSFR >> 1;
 		LSFR = LSFRShifted | (((LSFRShifted ^ LSFR) & 0x1) << 14);
 	}
 	//7-bit LSFR Cache Generation:
-	this.LSFR7Table = this.getTypedArray(0x800, 0, "float32");
+	this.LSFR7Table = this.getTypedArray(0x800, 0, "int8");
 	LSFR = 0x7F;	//Seed value has all its bits set.
 	for (index = 0; index < 0x80; ++index) {
 		//Normalize the last LSFR value for usage:
 		randomFactor = 1 - (LSFR & 1);	//Docs say it's the inverse.
 		//Cache the different volume level results:
-		this.LSFR7Table[0x080 | index] = randomFactor * 0x1 / 0x1E;
-		this.LSFR7Table[0x100 | index] = randomFactor * 0x2 / 0x1E;
-		this.LSFR7Table[0x180 | index] = randomFactor * 0x3 / 0x1E;
-		this.LSFR7Table[0x200 | index] = randomFactor * 0x4 / 0x1E;
-		this.LSFR7Table[0x280 | index] = randomFactor * 0x5 / 0x1E;
-		this.LSFR7Table[0x300 | index] = randomFactor * 0x6 / 0x1E;
-		this.LSFR7Table[0x380 | index] = randomFactor * 0x7 / 0x1E;
-		this.LSFR7Table[0x400 | index] = randomFactor * 0x8 / 0x1E;
-		this.LSFR7Table[0x480 | index] = randomFactor * 0x9 / 0x1E;
-		this.LSFR7Table[0x500 | index] = randomFactor * 0xA / 0x1E;
-		this.LSFR7Table[0x580 | index] = randomFactor * 0xB / 0x1E;
-		this.LSFR7Table[0x600 | index] = randomFactor * 0xC / 0x1E;
-		this.LSFR7Table[0x680 | index] = randomFactor * 0xD / 0x1E;
-		this.LSFR7Table[0x700 | index] = randomFactor * 0xE / 0x1E;
-		this.LSFR7Table[0x780 | index] = randomFactor / 2;
+		this.LSFR7Table[0x080 | index] = randomFactor;
+		this.LSFR7Table[0x100 | index] = randomFactor * 0x2;
+		this.LSFR7Table[0x180 | index] = randomFactor * 0x3;
+		this.LSFR7Table[0x200 | index] = randomFactor * 0x4;
+		this.LSFR7Table[0x280 | index] = randomFactor * 0x5;
+		this.LSFR7Table[0x300 | index] = randomFactor * 0x6;
+		this.LSFR7Table[0x380 | index] = randomFactor * 0x7;
+		this.LSFR7Table[0x400 | index] = randomFactor * 0x8;
+		this.LSFR7Table[0x480 | index] = randomFactor * 0x9;
+		this.LSFR7Table[0x500 | index] = randomFactor * 0xA;
+		this.LSFR7Table[0x580 | index] = randomFactor * 0xB;
+		this.LSFR7Table[0x600 | index] = randomFactor * 0xC;
+		this.LSFR7Table[0x680 | index] = randomFactor * 0xD;
+		this.LSFR7Table[0x700 | index] = randomFactor * 0xE;
+		this.LSFR7Table[0x780 | index] = randomFactor * 0xF;
 		//Recompute the LSFR algorithm:
 		LSFRShifted = LSFR >> 1;
 		LSFR = LSFRShifted | (((LSFRShifted ^ LSFR) & 0x1) << 6);
 	}
-	if (!this.noiseSampleTable && this.memory.length == 0x10000) {
-		//If enabling audio for the first time after a game is already running, set up the internal table reference:
-		this.noiseSampleTable = ((this.memory[0xFF22] & 0x8) == 0x8) ? this.LSFR7Table : this.LSFR15Table;
-	}
-}
-GameBoyCore.prototype.audioUnderRun = function (samplesRequestedRaw) {
-	if (settings[0]) {
-		//We need more audio samples since we went below our set low limit:
-		var neededSamples = this.audioIndex - samplesRequestedRaw;
-		if (neededSamples < 0) {
-			//Use any existing samples and then create some:
-			var tempBuffer = [];
-			if (this.audioIndex > 0) {
-				for (var index = 0; index < this.audioIndex; ++index) {
-					tempBuffer.push(this.currentBuffer[index]);
-				}
-				samplesRequestedRaw -= this.audioIndex;
-				this.audioIndex = 0;
-			}
-			return (samplesRequestedRaw > 0) ? this.generateAudioSafe(tempBuffer, samplesRequestedRaw >> this.soundFrameShifter) : tempBuffer;
-		}
-		else if (neededSamples == 0) {
-			//Use the overflow buffer's existing samples:
-			this.audioIndex = 0;
-			return this.currentBuffer;
-		}
-		else {
-			//Use the overflow buffer's existing samples:
-			var tempBuffer = [];
-			var currentBuffer = this.currentBuffer;
-			for (var index = 0; index < samplesRequestedRaw; ++index) {
-				tempBuffer[index] = currentBuffer[index];
-			}
-			this.audioIndex = neededSamples;
-			while (--neededSamples >= 0) {
-				//Move over the remaining samples to their new positions:
-				this.currentBuffer[neededSamples] = this.currentBuffer[samplesRequestedRaw + neededSamples];
-			}
-			return tempBuffer;
-		}
-	}
-	else {
-		//Return nothing just in case the callback is still hooked:
-		return [];
-	}
+	//Set the default noise table:
+	this.noiseSampleTable = this.LSFR15Table;
 }
 GameBoyCore.prototype.audioUnderrunAdjustment = function () {
 	if (settings[0]) {
-		var underrunAmount = this.bufferContainAmount - this.audioHandle.remainingBuffer();
-		if (underrunAmount > 0) {
-			this.CPUCyclesTotalCurrent += (underrunAmount >> this.soundFrameShifter) * this.samplesOut;
-			this.recalculateIterationClockLimit();
+		var underrunAmount = this.audioHandle.remainingBuffer();
+		if (typeof underrunAmount == "number") {
+			underrunAmount = this.bufferContainAmount - Math.max(underrunAmount, 0);
+			if (underrunAmount > 0) {
+				this.CPUCyclesTotalCurrent += (underrunAmount >> 1) * this.audioResamplerFirstPassFactor;
+				this.recalculateIterationClockLimit();
+			}
 		}
 	}
 }
-GameBoyCore.prototype.initializeAudioStartState = function (resetType) {
-	this.channel1adjustedFrequencyPrep = 0;
-	this.channel1adjustedDuty = 0.5;
+GameBoyCore.prototype.initializeAudioStartState = function () {
+	this.channel1FrequencyTracker = 0x2000;
+	this.channel1DutyTracker = 0;
+	this.channel1CachedDuty = this.dutyLookup[2];
 	this.channel1totalLength = 0;
 	this.channel1envelopeVolume = 0;
-	this.channel1currentVolume = 0;
 	this.channel1envelopeType = false;
 	this.channel1envelopeSweeps = 0;
+	this.channel1envelopeSweepsLast = 0;
 	this.channel1consecutive = true;
 	this.channel1frequency = 0;
-	this.channel1Fault = 0x2;
+	this.channel1SweepFault = false;
 	this.channel1ShadowFrequency = 0;
-	this.channel1volumeEnvTime = 0;
-	this.channel1volumeEnvTimeLast = 0;
-	this.channel1timeSweep = 0;
+	this.channel1timeSweep = 1;
 	this.channel1lastTimeSweep = 0;
-	this.channel1numSweep = 0;
+	this.channel1Swept = false;
 	this.channel1frequencySweepDivider = 0;
 	this.channel1decreaseSweep = false;
-	this.channel2adjustedFrequencyPrep = 0;
-	this.channel2adjustedDuty = 0.5;
+	this.channel2FrequencyTracker = 0x2000;
+	this.channel2DutyTracker = 0;
+	this.channel2CachedDuty = this.dutyLookup[2];
 	this.channel2totalLength = 0;
 	this.channel2envelopeVolume = 0;
-	this.channel2currentVolume = 0;
 	this.channel2envelopeType = false;
 	this.channel2envelopeSweeps = 0;
+	this.channel2envelopeSweepsLast = 0;
 	this.channel2consecutive = true;
 	this.channel2frequency = 0;
-	this.channel2volumeEnvTime = 0;
-	this.channel2volumeEnvTimeLast = 0;
 	this.channel3canPlay = false;
 	this.channel3totalLength = 0;
-	this.channel3patternType = -0x20;
+	this.channel3patternType = 4;
 	this.channel3frequency = 0;
 	this.channel3consecutive = true;
-	this.channel3adjustedFrequencyPrep = 0x20000 / settings[14];
-	this.channel4adjustedFrequencyPrep = 0;
+	this.channel3Counter = 0x800;
+	this.channel4FrequencyPeriod = 8;
 	this.channel4totalLength = 0;
 	this.channel4envelopeVolume = 0;
 	this.channel4currentVolume = 0;
 	this.channel4envelopeType = false;
 	this.channel4envelopeSweeps = 0;
+	this.channel4envelopeSweepsLast = 0;
 	this.channel4consecutive = true;
-	this.channel4volumeEnvTime = 0;
-	this.channel4volumeEnvTimeLast = 0;
-	this.noiseTableLength = 0x8000;
+	this.channel4BitRange = 0x7FFF;
 	this.noiseSampleTable = this.LSFR15Table;
 	this.channel4VolumeShifter = 15;
-	this.channel1lastSampleLookup = 0;
-	this.channel2lastSampleLookup = 0;
-	this.channel3Tracker = 0;
+	this.channel1FrequencyCounter = 0x2000;
+	this.channel2FrequencyCounter = 0x2000;
+	this.channel3Counter = 0x800;
+	this.channel3FrequencyPeriod = 0x800;
+	this.channel3lastSampleLookup = 0;
 	this.channel4lastSampleLookup = 0;
-	this.VinLeftChannelMasterVolume = 1;
-	this.VinRightChannelMasterVolume = 1;
+	this.VinLeftChannelMasterVolume = 8;
+	this.VinRightChannelMasterVolume = 8;
+	this.mixerOutputCache = 0;
+	this.sequencerClocks = 0x2000;
+	this.sequencePosition = 0;
+	this.channel4FrequencyPeriod = 8;
+	this.channel4Counter = 8;
+	this.cachedChannel3Sample = 0;
+	this.cachedChannel4Sample = 0;
+	this.channel1Enabled = false;
+	this.channel2Enabled = false;
+	this.channel3Enabled = false;
+	this.channel4Enabled = false;
+	this.channel1canPlay = false;
+	this.channel2canPlay = false;
+	this.channel4canPlay = false;
+	this.audioClocksUntilNextEvent = 1;
+	this.audioClocksUntilNextEventCounter = 1;
+	this.channel1OutputLevelCache();
+	this.channel2OutputLevelCache();
+	this.channel3OutputLevelCache();
+	this.channel4OutputLevelCache();
+	this.noiseSampleTable = this.LSFR15Table;
+}
+GameBoyCore.prototype.outputAudio = function () {
+	this.audioBuffer[this.audioDestinationPosition++] = (this.downsampleInput >>> 16) * this.downSampleInputDivider - 1;
+	this.audioBuffer[this.audioDestinationPosition++] = (this.downsampleInput & 0xFFFF) * this.downSampleInputDivider - 1;
+	if (this.audioDestinationPosition == this.numSamplesTotal) {
+		this.audioHandle.writeAudioNoCallback(this.audioBuffer);
+		this.audioDestinationPosition = 0;
+	}
+	this.downsampleInput = 0;
 }
 //Below are the audio generation functions timed against the CPU:
 GameBoyCore.prototype.generateAudio = function (numSamples) {
-	if (this.soundMasterEnabled) {
-		if (!settings[1]) {						//Split Mono & Stereo into two, to avoid this if statement every iteration of the loop.
-			while (--numSamples > -1) {
-				//STEREO
-				this.audioChannelsComputeStereo();
-				this.currentBuffer[this.audioIndex++] = this.currentSampleLeft * this.VinLeftChannelMasterVolume - 1;
-				this.currentBuffer[this.audioIndex++] = this.currentSampleRight * this.VinRightChannelMasterVolume - 1;
-				if (this.audioIndex == this.numSamplesTotal) {
+	var multiplier = 0;
+	if (this.soundMasterEnabled && !this.CPUStopped) {
+		for (var clockUpTo = 0; numSamples > 0;) {
+			clockUpTo = Math.min(this.audioClocksUntilNextEventCounter, this.sequencerClocks, numSamples);
+			this.audioClocksUntilNextEventCounter -= clockUpTo;
+			this.sequencerClocks -= clockUpTo;
+			numSamples -= clockUpTo;
+			while (clockUpTo > 0) {
+				multiplier = Math.min(clockUpTo, this.audioResamplerFirstPassFactor - this.audioIndex);
+				clockUpTo -= multiplier;
+				this.audioIndex += multiplier;
+				this.downsampleInput += this.mixerOutputCache * multiplier;
+				if (this.audioIndex == this.audioResamplerFirstPassFactor) {
 					this.audioIndex = 0;
-					this.audioHandle.writeAudio(this.currentBuffer);
+					this.outputAudio();
 				}
 			}
-		}
-		else {
-			while (--numSamples > -1) {
-				//MONO
-				this.audioChannelsComputeStereo();
-				this.currentBuffer[this.audioIndex++] = this.currentSampleRight * this.VinRightChannelMasterVolume - 1;
-				if (this.audioIndex == this.numSamplesTotal) {
-					this.audioIndex = 0;
-					this.audioHandle.writeAudio(this.currentBuffer);
-				}
+			if (this.sequencerClocks == 0) {
+				this.audioComputeSequencer();
+				this.sequencerClocks = 0x2000;
+			}
+			if (this.audioClocksUntilNextEventCounter == 0) {
+				this.computeAudioChannels();
 			}
 		}
 	}
 	else {
 		//SILENT OUTPUT:
-		if (!settings[1]) {
-			while (--numSamples > -1) {
-				//STEREO
-				this.currentBuffer[this.audioIndex++] = -1;
-				this.currentBuffer[this.audioIndex++] = -1;
-				if (this.audioIndex == this.numSamplesTotal) {
-					this.audioIndex = 0;
-					this.audioHandle.writeAudio(this.currentBuffer);
-				}
+		while (numSamples > 0) {
+			multiplier = Math.min(numSamples, this.audioResamplerFirstPassFactor - this.audioIndex);
+			numSamples -= multiplier;
+			this.audioIndex += multiplier;
+			if (this.audioIndex == this.audioResamplerFirstPassFactor) {
+				this.audioIndex = 0;
+				this.outputAudio();
 			}
 		}
-		else {
-			while (--numSamples > -1) {
-				//MONO
-				this.currentBuffer[this.audioIndex++] = -1;
-				if (this.audioIndex == this.numSamplesTotal) {
-					this.audioIndex = 0;
-					this.audioHandle.writeAudio(this.currentBuffer);
-				}
+	}
+}
+//Generate audio, but don't actually output it (Used for when sound is disabled by user/browser):
+GameBoyCore.prototype.generateAudioFake = function (numSamples) {
+	if (this.soundMasterEnabled && !this.CPUStopped) {
+		for (var clockUpTo = 0; numSamples > 0;) {
+			clockUpTo = Math.min(this.audioClocksUntilNextEventCounter, this.sequencerClocks, numSamples);
+			this.audioClocksUntilNextEventCounter -= clockUpTo;
+			this.sequencerClocks -= clockUpTo;
+			numSamples -= clockUpTo;
+			if (this.sequencerClocks == 0) {
+				this.audioComputeSequencer();
+				this.sequencerClocks = 0x2000;
+			}
+			if (this.audioClocksUntilNextEventCounter == 0) {
+				this.computeAudioChannels();
 			}
 		}
 	}
 }
 GameBoyCore.prototype.audioJIT = function () {
+	//Audio Sample Generation Timing:
 	if (settings[0]) {
-		//Audio Sample Generation Timing:
-		var amount = this.audioTicks * this.samplesOut;
-		var actual = amount | 0;
-		this.rollover += amount - actual;
-		if (this.rollover >= 1) {
-			--this.rollover;
-			++actual;
-		}
-		this.generateAudio(actual);
+		this.generateAudio(this.audioTicks);
+	}
+	else {
+		this.generateAudioFake(this.audioTicks);
 	}
 	this.audioTicks = 0;
 }
-GameBoyCore.prototype.audioChannelsComputeStereo = function () {
+GameBoyCore.prototype.audioComputeSequencer = function () {
+	switch (this.sequencePosition++) {
+		case 0:
+			this.clockAudioLength();
+			break;
+		case 2:
+			this.clockAudioLength();
+			this.clockAudioSweep();
+			break;
+		case 4:
+			this.clockAudioLength();
+			break;
+		case 6:
+			this.clockAudioLength();
+			this.clockAudioSweep();
+			break;
+		case 7:
+			this.clockAudioEnvelope();
+			this.sequencePosition = 0;
+	}
+}
+GameBoyCore.prototype.clockAudioLength = function () {
 	//Channel 1:
-	if ((this.channel1consecutive || this.channel1totalLength > 0) && this.channel1Fault == 0) {
-		if (this.channel1lastSampleLookup <= this.channel1adjustedDuty) {
-			this.currentSampleLeft = (this.leftChannel0) ? this.channel1currentVolume : 0;
-			this.currentSampleRight = (this.rightChannel0) ? this.channel1currentVolume : 0;
+	if (this.channel1totalLength > 1) {
+		--this.channel1totalLength;
+	}
+	else if (this.channel1totalLength == 1) {
+		this.channel1totalLength = 0;
+		this.channel1EnableCheck();
+		this.memory[0xFF26] &= 0xFE;	//Channel #1 On Flag Off
+	}
+	//Channel 2:
+	if (this.channel2totalLength > 1) {
+		--this.channel2totalLength;
+	}
+	else if (this.channel2totalLength == 1) {
+		this.channel2totalLength = 0;
+		this.channel2EnableCheck();
+		this.memory[0xFF26] &= 0xFD;	//Channel #2 On Flag Off
+	}
+	//Channel 3:
+	if (this.channel3totalLength > 1) {
+		--this.channel3totalLength;
+	}
+	else if (this.channel3totalLength == 1) {
+		this.channel3totalLength = 0;
+		this.channel3EnableCheck();
+		this.memory[0xFF26] &= 0xFB;	//Channel #3 On Flag Off
+	}
+	//Channel 4:
+	if (this.channel4totalLength > 1) {
+		--this.channel4totalLength;
+	}
+	else if (this.channel4totalLength == 1) {
+		this.channel4totalLength = 0;
+		this.channel4EnableCheck();
+		this.memory[0xFF26] &= 0xF7;	//Channel #4 On Flag Off
+	}
+}
+GameBoyCore.prototype.clockAudioSweep = function () {
+	//Channel 1:
+	if (!this.channel1SweepFault && this.channel1timeSweep > 0) {
+		if (--this.channel1timeSweep == 0) {
+			this.runAudioSweep();
 		}
-		else {
-			this.currentSampleRight = this.currentSampleLeft = 0;
-		}
-		if (this.channel1numSweep > 0) {
-			if (--this.channel1timeSweep == 0) {
-				--this.channel1numSweep;
-				if (this.channel1decreaseSweep) {
-					this.channel1ShadowFrequency -= this.channel1ShadowFrequency >> this.channel1frequencySweepDivider;
-					//Pre-calculate the frequency computation outside the waveform generator for speed:
-					this.channel1adjustedFrequencyPrep = this.preChewedAudioComputationMultiplier / (0x800 - this.channel1ShadowFrequency);
-				}
-				else {
-					this.channel1ShadowFrequency += this.channel1ShadowFrequency >> this.channel1frequencySweepDivider;
-					if (this.channel1ShadowFrequency <= 0x7FF) {
-						//Pre-calculate the frequency computation outside the waveform generator for speed:
-						this.channel1adjustedFrequencyPrep = this.preChewedAudioComputationMultiplier / (0x800 - this.channel1ShadowFrequency);
-					}
-					else {
-						this.channel1Fault |= 0x2;
+	}
+}
+GameBoyCore.prototype.runAudioSweep = function () {
+	//Channel 1:
+	if (this.channel1lastTimeSweep > 0) {
+		if (this.channel1frequencySweepDivider > 0) {
+			this.channel1Swept = true;
+			if (this.channel1decreaseSweep) {
+				this.channel1ShadowFrequency -= this.channel1ShadowFrequency >> this.channel1frequencySweepDivider;
+				this.channel1frequency = this.channel1ShadowFrequency & 0x7FF;
+				this.channel1FrequencyTracker = (0x800 - this.channel1frequency) << 2;
+			}
+			else {
+				this.channel1ShadowFrequency += this.channel1ShadowFrequency >> this.channel1frequencySweepDivider;
+				this.channel1frequency = this.channel1ShadowFrequency;
+				if (this.channel1ShadowFrequency <= 0x7FF) {
+					this.channel1FrequencyTracker = (0x800 - this.channel1frequency) << 2;
+					//Run overflow check twice:
+					if ((this.channel1ShadowFrequency + (this.channel1ShadowFrequency >> this.channel1frequencySweepDivider)) > 0x7FF) {
+						this.channel1SweepFault = true;
+						this.channel1EnableCheck();
 						this.memory[0xFF26] &= 0xFE;	//Channel #1 On Flag Off
 					}
 				}
-				this.channel1timeSweep = this.channel1lastTimeSweep;
+				else {
+					this.channel1frequency &= 0x7FF;
+					this.channel1SweepFault = true;
+					this.channel1EnableCheck();
+					this.memory[0xFF26] &= 0xFE;	//Channel #1 On Flag Off
+				}
 			}
+			this.channel1timeSweep = this.channel1lastTimeSweep;
 		}
-		if (this.channel1envelopeSweeps > 0) {
-			if (this.channel1volumeEnvTime > 0) {
-				--this.channel1volumeEnvTime;
+		else {
+			//Channel has sweep disabled and timer becomes a length counter:
+			this.channel1SweepFault = true;
+			this.channel1EnableCheck();
+		}
+	}
+}
+GameBoyCore.prototype.channel1AudioSweepPerformDummy = function () {
+	//Channel 1:
+	if (this.channel1frequencySweepDivider > 0) {
+		if (!this.channel1decreaseSweep) {
+			var channel1ShadowFrequency = this.channel1ShadowFrequency + (this.channel1ShadowFrequency >> this.channel1frequencySweepDivider);
+			if (channel1ShadowFrequency <= 0x7FF) {
+				//Run overflow check twice:
+				if ((channel1ShadowFrequency + (channel1ShadowFrequency >> this.channel1frequencySweepDivider)) > 0x7FF) {
+					this.channel1SweepFault = true;
+					this.channel1EnableCheck();
+					this.memory[0xFF26] &= 0xFE;	//Channel #1 On Flag Off
+				}
 			}
 			else {
-				if (!this.channel1envelopeType) {
-					if (this.channel1envelopeVolume > 0) {
-						this.channel1currentVolume = --this.channel1envelopeVolume / 0x1E;
-						this.channel1volumeEnvTime = this.channel1volumeEnvTimeLast;
-					}
-					else {
-						this.channel1envelopeSweeps = 0;
-					}
-				}
-				else if (this.channel1envelopeVolume < 0xF) {
-					this.channel1currentVolume = ++this.channel1envelopeVolume / 0x1E;
-					this.channel1volumeEnvTime = this.channel1volumeEnvTimeLast;
-				}
-				else {
-					this.channel1envelopeSweeps = 0;
-				}
-			}
-		}
-		if (this.channel1totalLength > 0) {
-			--this.channel1totalLength;
-			if (this.channel1totalLength <= 0) {
+				this.channel1SweepFault = true;
+				this.channel1EnableCheck();
 				this.memory[0xFF26] &= 0xFE;	//Channel #1 On Flag Off
 			}
 		}
-		this.channel1lastSampleLookup += this.channel1adjustedFrequencyPrep;
-		while (this.channel1lastSampleLookup >= 1) {
-			this.channel1lastSampleLookup -= 1;
-		}
 	}
-	else {
-		this.currentSampleRight = this.currentSampleLeft = 0;
+}
+GameBoyCore.prototype.clockAudioEnvelope = function () {
+	//Channel 1:
+	if (this.channel1envelopeSweepsLast > -1) {
+		if (this.channel1envelopeSweeps > 0) {
+			--this.channel1envelopeSweeps;
+		}
+		else {
+			if (!this.channel1envelopeType) {
+				if (this.channel1envelopeVolume > 0) {
+					--this.channel1envelopeVolume;
+					this.channel1envelopeSweeps = this.channel1envelopeSweepsLast;
+					this.channel1OutputLevelCache();
+				}
+				else {
+					this.channel1envelopeSweepsLast = -1;
+				}
+			}
+			else if (this.channel1envelopeVolume < 0xF) {
+				++this.channel1envelopeVolume;
+				this.channel1envelopeSweeps = this.channel1envelopeSweepsLast;
+				this.channel1OutputLevelCache();
+			}
+			else {
+				this.channel1envelopeSweepsLast = -1;
+			}
+		}
 	}
 	//Channel 2:
-	if ((this.channel2consecutive || this.channel2totalLength > 0)) {
-		if (this.channel2lastSampleLookup <= this.channel2adjustedDuty) {
-			if (this.leftChannel1) {
-				this.currentSampleLeft += this.channel2currentVolume;
-			}
-			if (this.rightChannel1) {
-				this.currentSampleRight += this.channel2currentVolume;
-			}
-		}
+	if (this.channel2envelopeSweepsLast > -1) {
 		if (this.channel2envelopeSweeps > 0) {
-			if (this.channel2volumeEnvTime > 0) {
-				--this.channel2volumeEnvTime;
-			}
-			else {
-				if (!this.channel2envelopeType) {
-					if (this.channel2envelopeVolume > 0) {
-						this.channel2currentVolume = --this.channel2envelopeVolume / 0x1E;
-						this.channel2volumeEnvTime = this.channel2volumeEnvTimeLast;
-					}
-					else {
-						this.channel2envelopeSweeps = 0;
-					}
-				}
-				else if (this.channel2envelopeVolume < 0xF) {
-					this.channel2currentVolume = ++this.channel2envelopeVolume / 0x1E;
-					this.channel2volumeEnvTime = this.channel2volumeEnvTimeLast;
+			--this.channel2envelopeSweeps;
+		}
+		else {
+			if (!this.channel2envelopeType) {
+				if (this.channel2envelopeVolume > 0) {
+					--this.channel2envelopeVolume;
+					this.channel2envelopeSweeps = this.channel2envelopeSweepsLast;
+					this.channel2OutputLevelCache();
 				}
 				else {
-					this.channel2envelopeSweeps = 0;
+					this.channel2envelopeSweepsLast = -1;
 				}
 			}
-		}
-		if (this.channel2totalLength > 0) {
-			--this.channel2totalLength;
-			if (this.channel2totalLength <= 0) {
-				this.memory[0xFF26] &= 0xFD;	//Channel #2 On Flag Off
+			else if (this.channel2envelopeVolume < 0xF) {
+				++this.channel2envelopeVolume;
+				this.channel2envelopeSweeps = this.channel2envelopeSweepsLast;
+				this.channel2OutputLevelCache();
 			}
-		}
-		this.channel2lastSampleLookup += this.channel2adjustedFrequencyPrep;
-		while (this.channel2lastSampleLookup >= 1) {
-			this.channel2lastSampleLookup -= 1;
-		}
-	}
-	//Channel 3:
-	if (this.channel3canPlay && (this.channel3consecutive || this.channel3totalLength > 0)) {
-		if (this.channel3patternType > -0x20) {
-			var PCMSample = this.channel3PCM[this.channel3Tracker | this.channel3patternType];
-			if (this.leftChannel2) {
-				this.currentSampleLeft += PCMSample;
-			}
-			if (this.rightChannel2) {
-				this.currentSampleRight += PCMSample;
-			}
-		}
-		this.channel3Tracker += this.channel3adjustedFrequencyPrep;
-		if (this.channel3Tracker >= 0x20) {
-			this.channel3Tracker -= 0x20;
-		}
-		if (this.channel3totalLength > 0) {
-			--this.channel3totalLength;
-			if (this.channel3totalLength <= 0) {
-				this.memory[0xFF26] &= 0xFB;	//Channel #3 On Flag Off
+			else {
+				this.channel2envelopeSweepsLast = -1;
 			}
 		}
 	}
 	//Channel 4:
-	if (this.channel4consecutive || this.channel4totalLength > 0) {
-		var duty = this.noiseSampleTable[this.channel4currentVolume | this.channel4lastSampleLookup];
-		if (this.leftChannel3) {
-			this.currentSampleLeft += duty;
-		}
-		if (this.rightChannel3) {
-			this.currentSampleRight += duty;
-		}
+	if (this.channel4envelopeSweepsLast > -1) {
 		if (this.channel4envelopeSweeps > 0) {
-			if (this.channel4volumeEnvTime > 0) {
-				--this.channel4volumeEnvTime;
-			}
-			else {
-				if (!this.channel4envelopeType) {
-					if (this.channel4envelopeVolume > 0) {
-						this.channel4currentVolume = --this.channel4envelopeVolume << this.channel4VolumeShifter;
-						this.channel4volumeEnvTime = this.channel4volumeEnvTimeLast;
-					}
-					else {
-						this.channel4envelopeSweeps = 0;
-					}
-				}
-				else if (this.channel4envelopeVolume < 0xF) {
-					this.channel4currentVolume = ++this.channel4envelopeVolume << this.channel4VolumeShifter;
-					this.channel4volumeEnvTime = this.channel4volumeEnvTimeLast;
+			--this.channel4envelopeSweeps;
+		}
+		else {
+			if (!this.channel4envelopeType) {
+				if (this.channel4envelopeVolume > 0) {
+					this.channel4currentVolume = --this.channel4envelopeVolume << this.channel4VolumeShifter;
+					this.channel4envelopeSweeps = this.channel4envelopeSweepsLast;
+					this.channel4UpdateCache();
 				}
 				else {
-					this.channel4envelopeSweeps = 0;
+					this.channel4envelopeSweepsLast = -1;
 				}
 			}
-		}
-		if (this.channel4totalLength > 0) {
-			--this.channel4totalLength;
-			if (this.channel4totalLength <= 0) {
-				this.memory[0xFF26] &= 0xF7;	//Channel #4 On Flag Off
+			else if (this.channel4envelopeVolume < 0xF) {
+				this.channel4currentVolume = ++this.channel4envelopeVolume << this.channel4VolumeShifter;
+				this.channel4envelopeSweeps = this.channel4envelopeSweepsLast;
+				this.channel4UpdateCache();
 			}
-		}
-		this.channel4lastSampleLookup += this.channel4adjustedFrequencyPrep;
-		if (this.channel4lastSampleLookup >= this.noiseTableLength) {
-			this.channel4lastSampleLookup -= this.noiseTableLength;
+			else {
+				this.channel4envelopeSweepsLast = -1;
+			}
 		}
 	}
 }
-//Below are the buffer-underrun protection audio refill functions:
-GameBoyCore.prototype.generateAudioSafe = function (tempBuffer, numSamples) {
-	if (this.soundMasterEnabled) {
-		if (!settings[1]) {						//Split Mono & Stereo into two, to avoid this if statement every iteration of the loop.
-			while (--numSamples > -1) {
-				//STEREO
-				this.audioChannelsComputeStereoSafe();
-				tempBuffer.push(this.currentSampleLeft * this.VinLeftChannelMasterVolume - 1);
-				tempBuffer.push(this.currentSampleRight * this.VinRightChannelMasterVolume - 1);
-			}
-		}
-		else {
-			while (--numSamples > -1) {
-				//MONO
-				this.audioChannelsComputeStereoSafe();
-				tempBuffer.push(this.currentSampleRight * this.VinRightChannelMasterVolume - 1);
-			}
-		}
+GameBoyCore.prototype.computeAudioChannels = function () {
+	//Clock down the four audio channels to the next closest audio event:
+	this.channel1FrequencyCounter -= this.audioClocksUntilNextEvent;
+	this.channel2FrequencyCounter -= this.audioClocksUntilNextEvent;
+	this.channel3Counter -= this.audioClocksUntilNextEvent;
+	this.channel4Counter -= this.audioClocksUntilNextEvent;
+	//Channel 1 counter:
+	if (this.channel1FrequencyCounter == 0) {
+		this.channel1FrequencyCounter = this.channel1FrequencyTracker;
+		this.channel1DutyTracker = (this.channel1DutyTracker + 1) & 0x7;
+		this.channel1OutputLevelTrimaryCache();
 	}
-	else {
-		//SILENT OUTPUT:
-		if (!settings[1]) {
-			while (--numSamples > -1) {
-				//STEREO
-				tempBuffer.push(-1);
-				tempBuffer.push(-1);
-			}
-		}
-		else {
-			while (--numSamples > -1) {
-				//MONO
-				tempBuffer.push(-1);
-			}
-		}
+	//Channel 2 counter:
+	if (this.channel2FrequencyCounter == 0) {
+		this.channel2FrequencyCounter = this.channel2FrequencyTracker;
+		this.channel2DutyTracker = (this.channel2DutyTracker + 1) & 0x7;
+		this.channel2OutputLevelTrimaryCache();
 	}
-	return tempBuffer;
+	//Channel 3 counter:
+	if (this.channel3Counter == 0) {
+		if (this.channel3canPlay) {
+			this.channel3lastSampleLookup = (this.channel3lastSampleLookup + 1) & 0x1F;
+		}
+		this.channel3Counter = this.channel3FrequencyPeriod;
+		this.channel3UpdateCache();
+	}
+	//Channel 4 counter:
+	if (this.channel4Counter == 0) {
+		this.channel4lastSampleLookup = (this.channel4lastSampleLookup + 1) & this.channel4BitRange;
+		this.channel4Counter = this.channel4FrequencyPeriod;
+		this.channel4UpdateCache();
+	}
+	//Find the number of clocks to next closest counter event:
+	this.audioClocksUntilNextEventCounter = this.audioClocksUntilNextEvent = Math.min(this.channel1FrequencyCounter, this.channel2FrequencyCounter, this.channel3Counter, this.channel4Counter);
 }
-GameBoyCore.prototype.audioChannelsComputeStereoSafe = function () {
-	//channel 1:
-	if ((this.channel1consecutive || this.channel1totalLength > 0) && this.channel1Fault == 0) {
-		if (this.channel1lastSampleLookup <= this.channel1adjustedDuty) {
-			this.currentSampleLeft = (this.leftChannel0) ? this.channel1currentVolume : 0;
-			this.currentSampleRight = (this.rightChannel0) ? this.channel1currentVolume : 0;
-		}
-		else {
-			this.currentSampleRight = this.currentSampleLeft = 0;
-		}
-		this.channel1lastSampleLookup += this.channel1adjustedFrequencyPrep;
-		while (this.channel1lastSampleLookup >= 1) {
-			this.channel1lastSampleLookup -= 1;
-		}
+GameBoyCore.prototype.channel1EnableCheck = function () {
+	this.channel1Enabled = ((this.channel1consecutive || this.channel1totalLength > 0) && !this.channel1SweepFault && this.channel1canPlay);
+	this.channel1OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel1VolumeEnableCheck = function () {
+	this.channel1canPlay = (this.memory[0xFF12] > 7);
+	this.channel1EnableCheck();
+	this.channel1OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel1OutputLevelCache = function () {
+	this.channel1currentSampleLeft = (this.leftChannel1) ? this.channel1envelopeVolume : 0;
+	this.channel1currentSampleRight = (this.rightChannel1) ? this.channel1envelopeVolume : 0;
+	this.channel1OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel1OutputLevelSecondaryCache = function () {
+	if (this.channel1Enabled) {
+		this.channel1currentSampleLeftSecondary = this.channel1currentSampleLeft;
+		this.channel1currentSampleRightSecondary = this.channel1currentSampleRight;
 	}
 	else {
-		this.currentSampleRight = this.currentSampleLeft = 0;
+		this.channel1currentSampleLeftSecondary = 0;
+		this.channel1currentSampleRightSecondary = 0;
 	}
-	//Channel 2:
-	if ((this.channel2consecutive || this.channel2totalLength > 0)) {
-		if (this.channel2lastSampleLookup <= this.channel2adjustedDuty) {
-			if (this.leftChannel1) {
-				this.currentSampleLeft += this.channel2currentVolume;
-			}
-			if (this.rightChannel1) {
-				this.currentSampleRight += this.channel2currentVolume;
-			}
-		}
-		this.channel2lastSampleLookup += this.channel2adjustedFrequencyPrep;
-		while (this.channel2lastSampleLookup >= 1) {
-			this.channel2lastSampleLookup -= 1;
-		}
+	this.channel1OutputLevelTrimaryCache();
+}
+GameBoyCore.prototype.channel1OutputLevelTrimaryCache = function () {
+	if (this.channel1CachedDuty[this.channel1DutyTracker]) {
+		this.channel1currentSampleLeftTrimary = this.channel1currentSampleLeftSecondary;
+		this.channel1currentSampleRightTrimary = this.channel1currentSampleRightSecondary;
 	}
-	//Channel 3:
-	if (this.channel3canPlay && (this.channel3consecutive || this.channel3totalLength > 0)) {
-		if (this.channel3patternType > -0x20) {
-			var PCMSample = this.channel3PCM[this.channel3Tracker | this.channel3patternType];
-			if (this.leftChannel2) {
-				this.currentSampleLeft += PCMSample;
-			}
-			if (this.rightChannel2) {
-				this.currentSampleRight += PCMSample;
-			}
-		}
-		this.channel3Tracker += this.channel3adjustedFrequencyPrep;
-		if (this.channel3Tracker >= 0x20) {
-			this.channel3Tracker -= 0x20;
-		}
+	else {
+		this.channel1currentSampleLeftTrimary = 0;
+		this.channel1currentSampleRightTrimary = 0;
 	}
-	//Channel 4:
-	if (this.channel4consecutive || this.channel4totalLength > 0) {
-		var duty = this.noiseSampleTable[this.channel4currentVolume | this.channel4lastSampleLookup];
-		if (this.leftChannel3) {
-			this.currentSampleLeft += duty;
-		}
-		if (this.rightChannel3) {
-			this.currentSampleRight += duty;
-		}
-		this.channel4lastSampleLookup += this.channel4adjustedFrequencyPrep;
-		if (this.channel4lastSampleLookup >= this.noiseTableLength) {
-			this.channel4lastSampleLookup -= this.noiseTableLength;
-		}
+	this.mixerOutputLevelCache();
+}
+GameBoyCore.prototype.channel2EnableCheck = function () {
+	this.channel2Enabled = ((this.channel2consecutive || this.channel2totalLength > 0) && this.channel2canPlay);
+	this.channel2OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel2VolumeEnableCheck = function () {
+	this.channel2canPlay = (this.memory[0xFF17] > 7);
+	this.channel2EnableCheck();
+	this.channel2OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel2OutputLevelCache = function () {
+	this.channel2currentSampleLeft = (this.leftChannel2) ? this.channel2envelopeVolume : 0;
+	this.channel2currentSampleRight = (this.rightChannel2) ? this.channel2envelopeVolume : 0;
+	this.channel2OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel2OutputLevelSecondaryCache = function () {
+	if (this.channel2Enabled) {
+		this.channel2currentSampleLeftSecondary = this.channel2currentSampleLeft;
+		this.channel2currentSampleRightSecondary = this.channel2currentSampleRight;
 	}
+	else {
+		this.channel2currentSampleLeftSecondary = 0;
+		this.channel2currentSampleRightSecondary = 0;
+	}
+	this.channel2OutputLevelTrimaryCache();
+}
+GameBoyCore.prototype.channel2OutputLevelTrimaryCache = function () {
+	if (this.channel2CachedDuty[this.channel2DutyTracker]) {
+		this.channel2currentSampleLeftTrimary = this.channel2currentSampleLeftSecondary;
+		this.channel2currentSampleRightTrimary = this.channel2currentSampleRightSecondary;
+	}
+	else {
+		this.channel2currentSampleLeftTrimary = 0;
+		this.channel2currentSampleRightTrimary = 0;
+	}
+	this.mixerOutputLevelCache();
+}
+GameBoyCore.prototype.channel3EnableCheck = function () {
+	this.channel3Enabled = (/*this.channel3canPlay && */(this.channel3consecutive || this.channel3totalLength > 0));
+	this.channel3OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel3OutputLevelCache = function () {
+	this.channel3currentSampleLeft = (this.leftChannel3) ? this.cachedChannel3Sample : 0;
+	this.channel3currentSampleRight = (this.rightChannel3) ? this.cachedChannel3Sample : 0;
+	this.channel3OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel3OutputLevelSecondaryCache = function () {
+	if (this.channel3Enabled) {
+		this.channel3currentSampleLeftSecondary = this.channel3currentSampleLeft;
+		this.channel3currentSampleRightSecondary = this.channel3currentSampleRight;
+	}
+	else {
+		this.channel3currentSampleLeftSecondary = 0;
+		this.channel3currentSampleRightSecondary = 0;
+	}
+	this.mixerOutputLevelCache();
+}
+GameBoyCore.prototype.channel4EnableCheck = function () {
+	this.channel4Enabled = ((this.channel4consecutive || this.channel4totalLength > 0) && this.channel4canPlay);
+	this.channel4OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel4VolumeEnableCheck = function () {
+	this.channel4canPlay = (this.memory[0xFF21] > 7);
+	this.channel4EnableCheck();
+	this.channel4OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel4OutputLevelCache = function () {
+	this.channel4currentSampleLeft = (this.leftChannel4) ? this.cachedChannel4Sample : 0;
+	this.channel4currentSampleRight = (this.rightChannel4) ? this.cachedChannel4Sample : 0;
+	this.channel4OutputLevelSecondaryCache();
+}
+GameBoyCore.prototype.channel4OutputLevelSecondaryCache = function () {
+	if (this.channel4Enabled) {
+		this.channel4currentSampleLeftSecondary = this.channel4currentSampleLeft;
+		this.channel4currentSampleRightSecondary = this.channel4currentSampleRight;
+	}
+	else {
+		this.channel4currentSampleLeftSecondary = 0;
+		this.channel4currentSampleRightSecondary = 0;
+	}
+	this.mixerOutputLevelCache();
+}
+GameBoyCore.prototype.mixerOutputLevelCache = function () {
+	this.mixerOutputCache = ((((this.channel1currentSampleLeftTrimary + this.channel2currentSampleLeftTrimary + this.channel3currentSampleLeftSecondary + this.channel4currentSampleLeftSecondary) * this.VinLeftChannelMasterVolume) << 16) |
+	((this.channel1currentSampleRightTrimary + this.channel2currentSampleRightTrimary + this.channel3currentSampleRightSecondary + this.channel4currentSampleRightSecondary) * this.VinRightChannelMasterVolume));
+}
+GameBoyCore.prototype.channel3UpdateCache = function () {
+	this.cachedChannel3Sample = this.channel3PCM[this.channel3lastSampleLookup] >> this.channel3patternType;
+	this.channel3OutputLevelCache();
+}
+GameBoyCore.prototype.channel3WriteRAM = function (address, data) {
+	if (this.channel3canPlay) {
+		this.audioJIT();
+		//address = this.channel3lastSampleLookup >> 1;
+	}
+	this.memory[0xFF30 | address] = data;
+	address <<= 1;
+	this.channel3PCM[address] = data >> 4;
+	this.channel3PCM[address | 1] = data & 0xF;
+}
+GameBoyCore.prototype.channel4UpdateCache = function () {
+	this.cachedChannel4Sample = this.noiseSampleTable[this.channel4currentVolume | this.channel4lastSampleLookup];
+	this.channel4OutputLevelCache();
 }
 GameBoyCore.prototype.run = function () {
 	//The preprocessing before the actual iteration loop:
 	if ((this.stopEmulator & 2) == 0) {
 		if ((this.stopEmulator & 1) == 1) {
-			this.stopEmulator = 0;
-			this.drewFrame = false;
-			this.audioUnderrunAdjustment();
-			this.clockUpdate();			//Frame skip and RTC code.
-			if (!this.halt) {
-				this.executeIteration();
-			}
-			else {						//Finish the HALT rundown execution.
-				this.CPUTicks = 0;
-				this.calculateHALTPeriod();
-				if (this.halt) {
-					this.updateCoreFull();
-				}
-				else {
+			if (!this.CPUStopped) {
+				this.stopEmulator = 0;
+				this.audioUnderrunAdjustment();
+				this.clockUpdate();			//RTC clocking.
+				if (!this.halt) {
 					this.executeIteration();
 				}
+				else {						//Finish the HALT rundown execution.
+					this.CPUTicks = 0;
+					this.calculateHALTPeriod();
+					if (this.halt) {
+						this.updateCore();
+						this.iterationEndRoutine();
+					}
+					else {
+						this.executeIteration();
+					}
+				}
+				//Request the graphics target to be updated:
+				this.requestDraw();
 			}
-			
+			else {
+				this.audioUnderrunAdjustment();
+				this.audioTicks += this.CPUCyclesTotal;
+				this.audioJIT();
+				this.stopEmulator |= 1;			//End current loop.
+			}
 		}
 		else {		//We can only get here if there was an internal error, but the loop was restarted.
 			cout("Iterator restarted a faulted core.", 2);
@@ -5681,6 +5908,7 @@ GameBoyCore.prototype.run = function () {
 GameBoyCore.prototype.executeIteration = function () {
 	//Iterate the interpreter loop:
 	var opcodeToExecute = 0;
+	var timedTicks = 0;
 	while (this.stopEmulator == 0) {
 		//Interrupt Arming:
 		switch (this.IRQEnableDelay) {
@@ -5708,8 +5936,45 @@ GameBoyCore.prototype.executeIteration = function () {
 		this.CPUTicks = this.TICKTable[opcodeToExecute];
 		//Execute the current instruction:
 		this.OPCODE[opcodeToExecute](this);
-		//Update the state:
-		this.updateCoreFull();
+		//Update the state (Inlined updateCoreFull manually here):
+		//Update the clocking for the LCD emulation:
+		this.LCDTicks += this.CPUTicks >> this.doubleSpeedShifter;	//LCD Timing
+		this.LCDCONTROL[this.actualScanLine](this);					//Scan Line and STAT Mode Control
+		//Single-speed relative timing for A/V emulation:
+		timedTicks = this.CPUTicks >> this.doubleSpeedShifter;		//CPU clocking can be updated from the LCD handling.
+		this.audioTicks += timedTicks;								//Audio Timing
+		this.emulatorTicks += timedTicks;							//Emulator Timing
+		//CPU Timers:
+		this.DIVTicks += this.CPUTicks;								//DIV Timing
+		if (this.TIMAEnabled) {										//TIMA Timing
+			this.timerTicks += this.CPUTicks;
+			while (this.timerTicks >= this.TACClocker) {
+				this.timerTicks -= this.TACClocker;
+				if (++this.memory[0xFF05] == 0x100) {
+					this.memory[0xFF05] = this.memory[0xFF06];
+					this.interruptsRequested |= 0x4;
+					this.checkIRQMatching();
+				}
+			}
+		}
+		if (this.serialTimer > 0) {										//Serial Timing
+			//IRQ Counter:
+			this.serialTimer -= this.CPUTicks;
+			if (this.serialTimer <= 0) {
+				this.interruptsRequested |= 0x8;
+				this.checkIRQMatching();
+			}
+			//Bit Shit Counter:
+			this.serialShiftTimer -= this.CPUTicks;
+			if (this.serialShiftTimer <= 0) {
+				this.serialShiftTimer = this.serialShiftTimerAllocated;
+				this.memory[0xFF01] = ((this.memory[0xFF01] << 1) & 0xFE) | 0x01;	//We could shift in actual link data here if we were to implement such!!!
+			}
+		}
+		//End of iteration routine:
+		if (this.emulatorTicks >= this.CPUCyclesTotal) {
+			this.iterationEndRoutine();
+		}
 	}
 }
 GameBoyCore.prototype.iterationEndRoutine = function () {
@@ -5723,6 +5988,14 @@ GameBoyCore.prototype.iterationEndRoutine = function () {
 		this.emulatorTicks -= this.CPUCyclesTotal;
 		this.CPUCyclesTotalCurrent += this.CPUCyclesTotalRoundoff;
 		this.recalculateIterationClockLimit();
+	}
+}
+GameBoyCore.prototype.handleSTOP = function () {
+	this.CPUStopped = true;						//Stop CPU until joypad input changes.
+	this.iterationEndRoutine();
+	if (this.emulatorTicks < 0) {
+		this.audioTicks -= this.emulatorTicks;
+		this.audioJIT();
 	}
 }
 GameBoyCore.prototype.recalculateIterationClockLimit = function () {
@@ -5760,7 +6033,8 @@ GameBoyCore.prototype.scanLineMode0 = function () {	//Horizontal Blanking Period
 				}
 				this.modeSTAT = 3;
 			}
-			this.renderScanLine();
+			this.incrementScanLineQueue();
+			this.updateSpriteCount(this.actualScanLine);
 			this.STATTracker = 2;
 		}
 		if (this.LCDTicks >= this.spriteCount) {
@@ -5898,7 +6172,7 @@ GameBoyCore.prototype.initializeLCDController = function () {
 							if (parentObj.STATTracker == 0 && parentObj.mode2TriggerSTAT) {
 								parentObj.interruptsRequested |= 0x2;
 							}
-							parentObj.renderScanLine();
+							parentObj.incrementScanLineQueue();
 						}
 						if (parentObj.hdmaRunning) {
 							parentObj.executeHDMA();
@@ -5949,7 +6223,7 @@ GameBoyCore.prototype.initializeLCDController = function () {
 							if (parentObj.STATTracker == 0 && parentObj.mode2TriggerSTAT) {
 								parentObj.interruptsRequested |= 0x2;
 							}
-							parentObj.renderScanLine();
+							parentObj.incrementScanLineQueue();
 						}
 						if (parentObj.hdmaRunning) {
 							parentObj.executeHDMA();
@@ -5978,8 +6252,13 @@ GameBoyCore.prototype.initializeLCDController = function () {
 					parentObj.checkIRQMatching();
 					//Attempt to blit out to our canvas:
 					if (parentObj.drewBlank == 0) {
-						//Draw the frame:
-						parentObj.drawToCanvas();
+						//Ensure JIT framing alignment:
+						if (parentObj.totalLinesPassed < 144 || (parentObj.totalLinesPassed == 144 && parentObj.midScanlineOffset > -1)) {
+							//Make sure our gfx are up-to-date:
+							parentObj.graphicsJITVBlank();
+							//Draw the frame:
+							parentObj.prepareFrame();
+						}
 					}
 					else {
 						//LCD off takes at least 2 frames:
@@ -6043,8 +6322,12 @@ GameBoyCore.prototype.initializeLCDController = function () {
 	}
 }
 GameBoyCore.prototype.DisplayShowOff = function () {
+	if (this.drewBlank == 0) {
+		//Output a blank screen to the output framebuffer:
+		this.clearFrameBuffer();
+		this.drewFrame = true;
+	}
 	this.drewBlank = 2;
-	this.prepareFrame();
 }
 GameBoyCore.prototype.executeHDMA = function () {
 	this.DMAWrite(1);
@@ -6067,8 +6350,7 @@ GameBoyCore.prototype.executeHDMA = function () {
 	}
 }
 GameBoyCore.prototype.clockUpdate = function () {
-	//We're tying in the same timer for RTC and frame skipping, since we can and this reduces load.
-	if (settings[7] || this.cTIMER) {
+	if (this.cTIMER) {
 		var dateObj = new Date();
 		var newTime = dateObj.getTime();
 		var timeElapsed = newTime - this.lastIteration;	//Get the numnber of milliseconds since this last executed.
@@ -6093,158 +6375,106 @@ GameBoyCore.prototype.clockUpdate = function () {
 				}
 			}
 		}
-		if (settings[7]) {
-			//Auto Frame Skip:
-			++this.iterations;
-			if (timeElapsed > settings[6] && ((newTime - this.firstIteration) / this.iterations) > (settings[6] + 1 + (settings[6] / this.iterations))) {
-				//Did not finish in time...
-				if (settings[4] < settings[8]) {
-					++settings[4];
-				}
-			}
-			else if (settings[4] > 0) {
-				//We finished on time, decrease frame skipping (throttle to somewhere just below full speed)...
-				--settings[4];
-			}
-			if (this.iterations > 200) {
-				this.iterations = 0;
-				this.firstIteration = newTime;
-			}
-		}
-	}
-}
-GameBoyCore.prototype.drawToCanvas = function () {
-	//Draw the frame buffer to the canvas:
-	if (!this.drewFrame && this.pixelCount > 0) {	//Throttle blitting to once per interpreter loop iteration.
-		if (settings[4] == 0 || this.frameCount > 0) {
-			//Copy and convert the framebuffer data to the CanvasPixelArray format.
-			this.prepareFrame();
-			if (settings[4] > 0) {
-				//Increment the frameskip counter:
-				this.frameCount -= settings[4];
-			}
-			this.drewFrame = true;
-		}
-		else {
-			//Reset the frameskip counter:
-			this.frameCount += settings[12];
-		}
 	}
 }
 GameBoyCore.prototype.prepareFrame = function () {
-	if (this.drewBlank == 0) {
-		if (settings[18] && this.width != 160 && this.height != 144) {
-			this.resizeFrameBuffer();
-		}
-		else {
-			var frameBuffer = this.frameBuffer;
-			var frame = this.completeFrame;
-			var length = frameBuffer.length;
-			for (var index = 0; index < length; ++index) {
-				frame[index] = frameBuffer[index];
-			}
-		}
-	}
-	if (!settings[11]) {
-		//If we have not detected v-blank timing support, then we'll just blit now:
+	//Copy the internal frame buffer to the output buffer:
+	this.swizzleFrameBuffer();
+	this.drewFrame = true;
+}
+GameBoyCore.prototype.requestDraw = function () {
+	if (this.drewFrame) {
 		this.dispatchDraw();
 	}
-	//Request a v-blank event to occur:
-	requestVBlank(this.canvas);
 }
 GameBoyCore.prototype.dispatchDraw = function () {
-	if (this.drewBlank == 0) {
-		this.swizzleFrameBuffer();
-	}
-	else {
-		this.drawBlankScreen();
-	}
-}
-GameBoyCore.prototype.swizzleFrameBuffer = function () {
-	var frameBuffer = this.completeFrame;
-	var bufferIndex = this.pixelCount;
-	var canvasData = this.canvasBuffer.data;
-	var canvasIndex = this.rgbCount;
-	while (canvasIndex > 3) {
-		canvasData[canvasIndex -= 4] = (frameBuffer[--bufferIndex] >> 16) & 0xFF;		//Red
-		canvasData[canvasIndex + 1] = (frameBuffer[bufferIndex] >> 8) & 0xFF;			//Green
-		canvasData[canvasIndex + 2] = frameBuffer[bufferIndex] & 0xFF;					//Blue
-	}
-	//Draw out the CanvasPixelArray data:
-	this.drawContext.putImageData(this.canvasBuffer, 0, 0);
-}
-GameBoyCore.prototype.drawBlankScreen = function () {
-	this.drawContext.fillStyle = (this.cGBC || this.colorizedGBPalettes) ? "rgb(248, 248, 248)" : "rgb(239, 255, 222)";
-	this.drawContext.fillRect(0, 0, this.width, this.height);
-}
-GameBoyCore.prototype.compileResizeFrameBufferFunction = function () {
-	//Attempt to resize the canvas in software instead of in CSS:
-	if (settings[13]) {
-		//JIT version:
-		var column = -1;
-		var columnOffset = 0;
-		var heightRatio = this.heightRatio;
-		var widthRatio = this.widthRatio;
-		var height = this.height;
-		var width = this.width;
-		var compileStringArray = [];
-		var compileStringIndex = 1;
-		compileStringArray[0] = "var a=this.frameBuffer,b=this.completeFrame";
-		for (var row = 0, rowOffset = 0, pixelOffset = -1; row < height; rowOffset = ((++row * heightRatio) | 0) * 160) {
-			for (column = -1, columnOffset = 0; ++column < width; columnOffset += widthRatio) {
-				compileStringArray[++compileStringIndex] = "b[" + (++pixelOffset) + "]=a[" + (rowOffset + (columnOffset | 0)) + "]";
-			}
-		}
-		compileStringArray[compileStringIndex + 1] = "return b";
-		this.resizeFrameBuffer = new Function(compileStringArray.join(";"));
-	}
-	else {
-		//Runtime resolving version:
-		this.resizeFrameBuffer = function () {
-			var column = -1;
-			var columnOffset = 0;
-			var targetFB = this.completeFrame;
-			var originalFB = this.frameBuffer;
-			var heightRatio = this.heightRatio;
-			var widthRatio = this.widthRatio;
-			var height = this.height;
-			var width = this.width;
-			for (var row = 0, rowOffset = 0, pixelOffset = -1; row < height; rowOffset = ((++row * heightRatio) | 0) * 160) {
-				for (column = -1, columnOffset = 0; ++column < width; columnOffset += widthRatio) {
-					targetFB[++pixelOffset] = originalFB[rowOffset + (columnOffset | 0)];
-				}
-			}
-			return targetFB;
-		}
-	}
-}
-GameBoyCore.prototype.renderScanLine = function () {
-	this.spriteCount = 252;		//Reset the extra clocking for STAT mode 3.
-	if (settings[4] == 0 || this.frameCount > 0) {
-		this.pixelStart = this.actualScanLine * 160;
-		if (this.bgEnabled) {
-			this.pixelEnd = 160;
-			this.BGLayerRender();
-			this.WindowLayerRender();
+	if (this.offscreenRGBCount > 0) {
+		//We actually updated the graphics internally, so copy out:
+		if (this.offscreenRGBCount == 92160) {
+			this.processDraw(this.swizzledFrame);
 		}
 		else {
-			var pixelLine = (this.actualScanLine + 1) * 160;
-			var defaultColor = (this.cGBC || this.colorizedGBPalettes) ? 0xF8F8F8 : 0xEFFFDE;
-			for (var pixelPosition = (this.actualScanLine * 160) + this.currentX; pixelPosition < pixelLine; pixelPosition++) {
-				this.frameBuffer[pixelPosition] = defaultColor;
-			}
+			this.resizeFrameBuffer();
 		}
-		this.SpriteLayerRender();
+	}
+}
+GameBoyCore.prototype.processDraw = function (frameBuffer) {
+	var canvasRGBALength = this.offscreenRGBCount;
+	var canvasData = this.canvasBuffer.data;
+	var bufferIndex = 0;
+	for (var canvasIndex = 0; canvasIndex < canvasRGBALength; ++canvasIndex) {
+		canvasData[canvasIndex++] = frameBuffer[bufferIndex++];
+		canvasData[canvasIndex++] = frameBuffer[bufferIndex++];
+		canvasData[canvasIndex++] = frameBuffer[bufferIndex++];
+	}
+	this.graphicsBlit();
+	this.drewFrame = false;
+}
+GameBoyCore.prototype.swizzleFrameBuffer = function () {
+	//Convert our dirty 24-bit (24-bit, with internal render flags above it) framebuffer to an 8-bit buffer with separate indices for the RGB channels:
+	var frameBuffer = this.frameBuffer;
+	var swizzledFrame = this.swizzledFrame;
+	var bufferIndex = 0;
+	for (var canvasIndex = 0; canvasIndex < 69120;) {
+		swizzledFrame[canvasIndex++] = (frameBuffer[bufferIndex] >> 16) & 0xFF;		//Red
+		swizzledFrame[canvasIndex++] = (frameBuffer[bufferIndex] >> 8) & 0xFF;		//Green
+		swizzledFrame[canvasIndex++] = frameBuffer[bufferIndex++] & 0xFF;			//Blue
+	}
+}
+GameBoyCore.prototype.clearFrameBuffer = function () {
+	var bufferIndex = 0;
+	var frameBuffer = this.swizzledFrame;
+	if (this.cGBC || this.colorizedGBPalettes) {
+		while (bufferIndex < 69120) {
+			frameBuffer[bufferIndex++] = 248;
+		}
 	}
 	else {
-		//Extra clocking of mode3 for CGB still needs to be done, even when we frameskip:
-		this.updateSpriteCount(this.actualScanLine);
+		while (bufferIndex < 69120) {
+			frameBuffer[bufferIndex++] = 239;
+			frameBuffer[bufferIndex++] = 255;
+			frameBuffer[bufferIndex++] = 222;
+		}
 	}
+}
+GameBoyCore.prototype.resizeFrameBuffer = function () {
+	//Resize in javascript with resize.js:
+	if (this.resizePathClear) {
+		this.resizePathClear = false;
+		this.resizer.resize(this.swizzledFrame);
+	}
+}
+GameBoyCore.prototype.compileResizeFrameBufferFunction = function () {
+	if (this.offscreenRGBCount > 0) {
+		var parentObj = this;
+		this.resizer = new Resize(160, 144, this.offscreenWidth, this.offscreenHeight, false, settings[13], false, function (buffer) {
+			if ((buffer.length / 3 * 4) == parentObj.offscreenRGBCount) {
+				parentObj.processDraw(buffer);
+			}
+			parentObj.resizePathClear = true;
+		});
+	}
+}
+GameBoyCore.prototype.renderScanLine = function (scanlineToRender) {
+	this.pixelStart = scanlineToRender * 160;
+	if (this.bgEnabled) {
+		this.pixelEnd = 160;
+		this.BGLayerRender(scanlineToRender);
+		this.WindowLayerRender(scanlineToRender);
+	}
+	else {
+		var pixelLine = (scanlineToRender + 1) * 160;
+		var defaultColor = (this.cGBC || this.colorizedGBPalettes) ? 0xF8F8F8 : 0xEFFFDE;
+		for (var pixelPosition = (scanlineToRender * 160) + this.currentX; pixelPosition < pixelLine; pixelPosition++) {
+			this.frameBuffer[pixelPosition] = defaultColor;
+		}
+	}
+	this.SpriteLayerRender(scanlineToRender);
 	this.currentX = 0;
 	this.midScanlineOffset = -1;
 }
 GameBoyCore.prototype.renderMidScanLine = function () {
-	if (this.actualScanLine < 144 && this.modeSTAT == 3 && (settings[4] == 0 || this.frameCount > 0)) {
+	if (this.actualScanLine < 144 && this.modeSTAT == 3) {
 		//TODO: Get this accurate:
 		if (this.midScanlineOffset == -1) {
 			this.midScanlineOffset = this.backgroundX & 0x7;
@@ -6253,15 +6483,15 @@ GameBoyCore.prototype.renderMidScanLine = function () {
 			this.pixelEnd = this.LCDTicks - 74;
 			this.pixelEnd = Math.min(this.pixelEnd - this.midScanlineOffset - (this.pixelEnd % 0x8), 160);
 			if (this.bgEnabled) {
-				this.pixelStart = this.actualScanLine * 160;
-				this.BGLayerRender();
-				this.WindowLayerRender();
+				this.pixelStart = this.lastUnrenderedLine * 160;
+				this.BGLayerRender(this.lastUnrenderedLine);
+				this.WindowLayerRender(this.lastUnrenderedLine);
 				//TODO: Do midscanline JIT for sprites...
 			}
 			else {
-				var pixelLine = (this.actualScanLine * 160) + this.pixelEnd;
+				var pixelLine = (this.lastUnrenderedLine * 160) + this.pixelEnd;
 				var defaultColor = (this.cGBC || this.colorizedGBPalettes) ? 0xF8F8F8 : 0xEFFFDE;
-				for (var pixelPosition = (this.actualScanLine * 160) + this.currentX; pixelPosition < pixelLine; pixelPosition++) {
+				for (var pixelPosition = (this.lastUnrenderedLine * 160) + this.currentX; pixelPosition < pixelLine; pixelPosition++) {
 					this.frameBuffer[pixelPosition] = defaultColor;
 				}
 			}
@@ -6275,28 +6505,27 @@ GameBoyCore.prototype.initializeModeSpecificArrays = function () {
 		this.gbcOBJRawPalette = this.getTypedArray(0x40, 0, "uint8");
 		this.gbcBGRawPalette = this.getTypedArray(0x40, 0, "uint8");
 		this.gbcOBJPalette = this.getTypedArray(0x20, 0x1000000, "int32");
-		this.gbcBGPalette = this.getTypedArray(0x20, 0, "int32");
+		this.gbcBGPalette = this.getTypedArray(0x40, 0, "int32");
 		this.BGCHRBank2 = this.getTypedArray(0x800, 0, "uint8");
 		this.BGCHRCurrentBank = (this.currVRAMBank > 0) ? this.BGCHRBank2 : this.BGCHRBank1;
 		this.tileCache = this.generateCacheArray(0xF80);
-		this.tileCacheValid = this.getTypedArray(0xF80, 0, "int8");
 	}
 	else {
-		this.gbOBJPalette = this.getTypedArray(8, 0x1000000, "int32");
+		this.gbOBJPalette = this.getTypedArray(8, 0, "int32");
 		this.gbBGPalette = this.getTypedArray(4, 0, "int32");
 		this.BGPalette = this.gbBGPalette;
 		this.OBJPalette = this.gbOBJPalette;
 		this.tileCache = this.generateCacheArray(0x700);
-		this.tileCacheValid = this.getTypedArray(0x700, 0, "int8");
+		this.sortBuffer = this.getTypedArray(0x100, 0, "uint8");
+		this.OAMAddressCache = this.getTypedArray(10, 0, "int32");
 	}
 	this.renderPathBuild();
 }
 GameBoyCore.prototype.GBCtoGBModeAdjust = function () {
 	cout("Stepping down from GBC mode.", 0);
-	this.tileCache = this.generateCacheArray(0x700);
-	this.tileCacheValid = this.getTypedArray(0x700, 0, "int8");
 	this.VRAM = this.GBCMemory = this.BGCHRCurrentBank = this.BGCHRBank2 = null;
-	if (settings[17]) {
+	this.tileCache.length = 0x700;
+	if (settings[4]) {
 		this.gbBGColorizedPalette = this.getTypedArray(4, 0, "int32");
 		this.gbOBJColorizedPalette = this.getTypedArray(8, 0, "int32");
 		this.cachedBGPaletteConversion = this.getTypedArray(4, 0, "int32");
@@ -6307,12 +6536,13 @@ GameBoyCore.prototype.GBCtoGBModeAdjust = function () {
 		this.getGBCColor();
 	}
 	else {
-		this.gbOBJPalette = this.getTypedArray(8, 0x1000000, "int32");
+		this.gbOBJPalette = this.getTypedArray(8, 0, "int32");
 		this.gbBGPalette = this.getTypedArray(4, 0, "int32");
 		this.BGPalette = this.gbBGPalette;
 		this.OBJPalette = this.gbOBJPalette;
 	}
-	this.resetOAMXCache();
+	this.sortBuffer = this.getTypedArray(0x100, 0, "uint8");
+	this.OAMAddressCache = this.getTypedArray(10, 0, "int32");
 	this.renderPathBuild();
 	this.memoryReadJumpCompile();
 	this.memoryWriteJumpCompile();
@@ -6324,13 +6554,23 @@ GameBoyCore.prototype.renderPathBuild = function () {
 		this.SpriteLayerRender = this.SpriteGBLayerRender;
 	}
 	else {
+		this.priorityFlaggingPathRebuild();
+		this.SpriteLayerRender = this.SpriteGBCLayerRender;
+	}
+}
+GameBoyCore.prototype.priorityFlaggingPathRebuild = function () {
+	if (this.BGPriorityEnabled) {
 		this.BGLayerRender = this.BGGBCLayerRender;
 		this.WindowLayerRender = this.WindowGBCLayerRender;
-		this.SpriteLayerRender = this.SpriteGBCLayerRender;
+	}
+	else {
+		this.BGLayerRender = this.BGGBCLayerRenderNoPriorityFlagging;
+		this.WindowLayerRender = this.WindowGBCLayerRenderNoPriorityFlagging;
 	}
 }
 GameBoyCore.prototype.initializeReferencesFromSaveState = function () {
 	this.LCDCONTROL = (this.LCDisOn) ? this.LINECONTROL : this.DISPLAYOFFCONTROL;
+	var tileIndex = 0;
 	if (!this.cGBC) {
 		if (this.colorizedGBPalettes) {
 			this.BGPalette = this.gbBGColorizedPalette;
@@ -6344,12 +6584,22 @@ GameBoyCore.prototype.initializeReferencesFromSaveState = function () {
 			this.OBJPalette = this.gbOBJPalette;
 		}
 		this.tileCache = this.generateCacheArray(0x700);
-		this.tileCacheValid = this.getTypedArray(0x700, 0, "int8");
+		for (tileIndex = 0x8000; tileIndex < 0x9000; tileIndex += 2) {
+			this.generateGBOAMTileLine(tileIndex);
+		}
+		for (tileIndex = 0x9000; tileIndex < 0x9800; tileIndex += 2) {
+			this.generateGBTileLine(tileIndex);
+		}
+		this.sortBuffer = this.getTypedArray(0x100, 0, "uint8");
+		this.OAMAddressCache = this.getTypedArray(10, 0, "int32");
 	}
 	else {
 		this.BGCHRCurrentBank = (this.currVRAMBank > 0) ? this.BGCHRBank2 : this.BGCHRBank1;
 		this.tileCache = this.generateCacheArray(0xF80);
-		this.tileCacheValid = this.getTypedArray(0xF80, 0, "int8");
+		for (; tileIndex < 0x1800; tileIndex += 0x10) {
+			this.generateGBCTileBank1(tileIndex);
+			this.generateGBCTileBank2(tileIndex);
+		}
 	}
 	this.renderPathBuild();
 }
@@ -6368,12 +6618,12 @@ GameBoyCore.prototype.getGBCColor = function () {
 		//BG
 		this.cachedBGPaletteConversion[counter] = this.RGBTint((this.gbcBGRawPalette[adjustedIndex | 1] << 8) | this.gbcBGRawPalette[adjustedIndex]);
 		//OBJ 1
-		this.cachedOBJPaletteConversion[counter] = 0x1000000 | this.RGBTint((this.gbcOBJRawPalette[adjustedIndex | 1] << 8) | this.gbcOBJRawPalette[adjustedIndex]);
+		this.cachedOBJPaletteConversion[counter] = this.RGBTint((this.gbcOBJRawPalette[adjustedIndex | 1] << 8) | this.gbcOBJRawPalette[adjustedIndex]);
 	}
 	//OBJ 2
 	for (counter = 4; counter < 8; counter++) {
 		adjustedIndex = counter << 1;
-		this.cachedOBJPaletteConversion[counter] = 0x1000000 | this.RGBTint((this.gbcOBJRawPalette[adjustedIndex | 1] << 8) | this.gbcOBJRawPalette[adjustedIndex]);
+		this.cachedOBJPaletteConversion[counter] = this.RGBTint((this.gbcOBJRawPalette[adjustedIndex | 1] << 8) | this.gbcOBJRawPalette[adjustedIndex]);
 	}
 	//Update the palette entries:
 	this.updateGBBGPalette = this.updateGBColorizedBGPalette;
@@ -6397,9 +6647,9 @@ GameBoyCore.prototype.updateGBColorizedBGPalette = function (data) {
 	this.gbBGColorizedPalette[3] = this.cachedBGPaletteConversion[data >> 6];
 }
 GameBoyCore.prototype.updateGBRegularOBJPalette = function (index, data) {
-	this.gbOBJPalette[index | 1] = this.objColors[(data >> 2) & 0x03];
-	this.gbOBJPalette[index | 2] = this.objColors[(data >> 4) & 0x03];
-	this.gbOBJPalette[index | 3] = this.objColors[data >> 6];
+	this.gbOBJPalette[index | 1] = this.colors[(data >> 2) & 0x03];
+	this.gbOBJPalette[index | 2] = this.colors[(data >> 4) & 0x03];
+	this.gbOBJPalette[index | 3] = this.colors[data >> 6];
 }
 GameBoyCore.prototype.updateGBColorizedOBJPalette = function (index, data) {
 	//GB colorization:
@@ -6409,16 +6659,22 @@ GameBoyCore.prototype.updateGBColorizedOBJPalette = function (index, data) {
 }
 GameBoyCore.prototype.updateGBCBGPalette = function (index, data) {
 	if (this.gbcBGRawPalette[index] != data) {
-		this.renderMidScanLine();
+		this.midScanLineJIT();
 		//Update the color palette for BG tiles since it changed:
 		this.gbcBGRawPalette[index] = data;
 		if ((index & 0x06) == 0) {
 			//Palette 0 (Special tile Priority stuff)
-			this.gbcBGPalette[index >> 1] = 0x2000000 | this.RGBTint((this.gbcBGRawPalette[index | 1] << 8) | this.gbcBGRawPalette[index & 0x3E]);
+			data = 0x2000000 | this.RGBTint((this.gbcBGRawPalette[index | 1] << 8) | this.gbcBGRawPalette[index & 0x3E]);
+			index >>= 1;
+			this.gbcBGPalette[index] = data;
+			this.gbcBGPalette[0x20 | index] = 0x1000000 | data;
 		}
 		else {
 			//Regular Palettes (No special crap)
-			this.gbcBGPalette[index >> 1] = this.RGBTint((this.gbcBGRawPalette[index | 1] << 8) | this.gbcBGRawPalette[index & 0x3E]);
+			data = this.RGBTint((this.gbcBGRawPalette[index | 1] << 8) | this.gbcBGRawPalette[index & 0x3E]);
+			index >>= 1;
+			this.gbcBGPalette[index] = data;
+			this.gbcBGPalette[0x20 | index] = 0x1000000 | data;
 		}
 	}
 }
@@ -6428,24 +6684,24 @@ GameBoyCore.prototype.updateGBCOBJPalette = function (index, data) {
 		this.gbcOBJRawPalette[index] = data;
 		if ((index & 0x06) > 0) {
 			//Regular Palettes (No special crap)
-			this.renderMidScanLine();
+			this.midScanLineJIT();
 			this.gbcOBJPalette[index >> 1] = 0x1000000 | this.RGBTint((this.gbcOBJRawPalette[index | 1] << 8) | this.gbcOBJRawPalette[index & 0x3E]);
 		}
 	}
 }
-GameBoyCore.prototype.BGGBLayerRender = function () {
-	var scrollYAdjusted = (this.backgroundY + this.actualScanLine) & 0xFF;					//The line of the BG we're at.
+GameBoyCore.prototype.BGGBLayerRender = function (scanlineToRender) {
+	var scrollYAdjusted = (this.backgroundY + scanlineToRender) & 0xFF;						//The line of the BG we're at.
 	var tileYLine = (scrollYAdjusted & 7) << 3;
 	var tileYDown = this.gfxBackgroundCHRBankPosition | ((scrollYAdjusted & 0xF8) << 2);	//The row of cached tiles we're fetching from.
 	var scrollXAdjusted = (this.backgroundX + this.currentX) & 0xFF;						//The scroll amount of the BG.
 	var pixelPosition = this.pixelStart + this.currentX;									//Current pixel we're working on.
-	var pixelPositionEnd = this.pixelStart + ((this.gfxWindowDisplay && (this.actualScanLine - this.windowY) >= 0) ? Math.min(Math.max(this.windowX, 0) + this.currentX, this.pixelEnd) : this.pixelEnd);	//Make sure we do at most 160 pixels a scanline.
+	var pixelPositionEnd = this.pixelStart + ((this.gfxWindowDisplay && (scanlineToRender - this.windowY) >= 0) ? Math.min(Math.max(this.windowX, 0) + this.currentX, this.pixelEnd) : this.pixelEnd);	//Make sure we do at most 160 pixels a scanline.
 	var tileNumber = tileYDown + (scrollXAdjusted >> 3);
 	var chrCode = this.BGCHRBank1[tileNumber];
 	if (chrCode < this.gfxBackgroundBankOffset) {
 		chrCode |= 0x100;
 	}
-	var tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBTile(chrCode);
+	var tile = this.tileCache[chrCode];
 	for (var texel = (scrollXAdjusted & 0x7); texel < 8 && pixelPosition < pixelPositionEnd && scrollXAdjusted < 0x100; ++scrollXAdjusted) {
 		this.frameBuffer[pixelPosition++] = this.BGPalette[tile[tileYLine | texel++]];
 	}
@@ -6457,7 +6713,7 @@ GameBoyCore.prototype.BGGBLayerRender = function () {
 		if (chrCode < this.gfxBackgroundBankOffset) {
 			chrCode |= 0x100;
 		}
-		tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBTile(chrCode);
+		tile = this.tileCache[chrCode];
 		texel = tileYLine;
 		this.frameBuffer[pixelPosition++] = this.BGPalette[tile[texel++]];
 		this.frameBuffer[pixelPosition++] = this.BGPalette[tile[texel++]];
@@ -6474,7 +6730,7 @@ GameBoyCore.prototype.BGGBLayerRender = function () {
 			if (chrCode < this.gfxBackgroundBankOffset) {
 				chrCode |= 0x100;
 			}
-			tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBTile(chrCode);
+			tile = this.tileCache[chrCode];
 			for (texel = tileYLine - 1; pixelPosition < pixelPositionEnd && scrollXAdjusted < 0x100; ++scrollXAdjusted) {
 				this.frameBuffer[pixelPosition++] = this.BGPalette[tile[++texel]];
 			}
@@ -6485,7 +6741,7 @@ GameBoyCore.prototype.BGGBLayerRender = function () {
 			if (chrCode < this.gfxBackgroundBankOffset) {
 				chrCode |= 0x100;
 			}
-			tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBTile(chrCode);
+			tile = this.tileCache[chrCode];
 			texel = tileYLine;
 			this.frameBuffer[pixelPosition++] = this.BGPalette[tile[texel++]];
 			this.frameBuffer[pixelPosition++] = this.BGPalette[tile[texel++]];
@@ -6501,7 +6757,7 @@ GameBoyCore.prototype.BGGBLayerRender = function () {
 			if (chrCode < this.gfxBackgroundBankOffset) {
 				chrCode |= 0x100;
 			}
-			tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBTile(chrCode);
+			tile = this.tileCache[chrCode];
 			switch (pixelPositionEnd - pixelPosition) {
 				case 7:
 					this.frameBuffer[pixelPosition + 6] = this.BGPalette[tile[tileYLine | 6]];
@@ -6521,25 +6777,23 @@ GameBoyCore.prototype.BGGBLayerRender = function () {
 		}
 	}
 }
-GameBoyCore.prototype.BGGBCLayerRender = function () {
-	var scrollYAdjusted = (this.backgroundY + this.actualScanLine) & 0xFF;					//The line of the BG we're at.
+GameBoyCore.prototype.BGGBCLayerRender = function (scanlineToRender) {
+	var scrollYAdjusted = (this.backgroundY + scanlineToRender) & 0xFF;						//The line of the BG we're at.
 	var tileYLine = (scrollYAdjusted & 7) << 3;
 	var tileYDown = this.gfxBackgroundCHRBankPosition | ((scrollYAdjusted & 0xF8) << 2);	//The row of cached tiles we're fetching from.
 	var scrollXAdjusted = (this.backgroundX + this.currentX) & 0xFF;						//The scroll amount of the BG.
 	var pixelPosition = this.pixelStart + this.currentX;									//Current pixel we're working on.
-	var pixelPositionEnd = this.pixelStart + ((this.gfxWindowDisplay && (this.actualScanLine - this.windowY) >= 0) ? Math.min(Math.max(this.windowX, 0) + this.currentX, this.pixelEnd) : this.pixelEnd);	//Make sure we do at most 160 pixels a scanline.
+	var pixelPositionEnd = this.pixelStart + ((this.gfxWindowDisplay && (scanlineToRender - this.windowY) >= 0) ? Math.min(Math.max(this.windowX, 0) + this.currentX, this.pixelEnd) : this.pixelEnd);	//Make sure we do at most 160 pixels a scanline.
 	var tileNumber = tileYDown + (scrollXAdjusted >> 3);
 	var chrCode = this.BGCHRBank1[tileNumber];
 	if (chrCode < this.gfxBackgroundBankOffset) {
 		chrCode |= 0x100;
 	}
 	var attrCode = this.BGCHRBank2[tileNumber];
-	chrCode |= ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5);
-	var tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBCTile(attrCode, chrCode);
-	var pixelFlag = (attrCode << 17) & this.BGPriorityEnabled;
-	var palette = (attrCode & 0x7) << 2;
+	var tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+	var palette = ((attrCode & 0x7) << 2) | ((attrCode & 0x80) >> 2);
 	for (var texel = (scrollXAdjusted & 0x7); texel < 8 && pixelPosition < pixelPositionEnd && scrollXAdjusted < 0x100; ++scrollXAdjusted) {
-		this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[tileYLine | texel++]];
 	}
 	var scrollXAdjustedAligned = Math.min(pixelPositionEnd - pixelPosition, 0x100 - scrollXAdjusted) >> 3;
 	scrollXAdjusted += scrollXAdjustedAligned << 3;
@@ -6550,19 +6804,17 @@ GameBoyCore.prototype.BGGBCLayerRender = function () {
 			chrCode |= 0x100;
 		}
 		attrCode = this.BGCHRBank2[tileNumber];
-		chrCode |= ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5);
-		tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBCTile(attrCode, chrCode);
-		pixelFlag = (attrCode << 17) & this.BGPriorityEnabled;
-		palette = (attrCode & 0x7) << 2;
+		tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+		palette = ((attrCode & 0x7) << 2) | ((attrCode & 0x80) >> 2);
 		texel = tileYLine;
-		this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-		this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-		this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-		this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-		this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-		this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-		this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-		this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel]];
 	}
 	if (pixelPosition < pixelPositionEnd) {
 		if (scrollXAdjusted < 0x100) {
@@ -6571,12 +6823,10 @@ GameBoyCore.prototype.BGGBCLayerRender = function () {
 				chrCode |= 0x100;
 			}
 			attrCode = this.BGCHRBank2[tileNumber];
-			chrCode |= ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5);
-			tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBCTile(attrCode, chrCode);
-			pixelFlag = (attrCode << 17) & this.BGPriorityEnabled;
-			palette = (attrCode & 0x7) << 2;
+			tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+			palette = ((attrCode & 0x7) << 2) | ((attrCode & 0x80) >> 2);
 			for (texel = tileYLine - 1; pixelPosition < pixelPositionEnd && scrollXAdjusted < 0x100; ++scrollXAdjusted) {
-				this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[++texel]];
+				this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[++texel]];
 			}
 		}
 		scrollXAdjustedAligned = ((pixelPositionEnd - pixelPosition) >> 3) + tileYDown;
@@ -6586,19 +6836,17 @@ GameBoyCore.prototype.BGGBCLayerRender = function () {
 				chrCode |= 0x100;
 			}
 			attrCode = this.BGCHRBank2[tileYDown++];
-			chrCode |= ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5);
-			tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBCTile(attrCode, chrCode);
-			pixelFlag = (attrCode << 17) & this.BGPriorityEnabled;
-			palette = (attrCode & 0x7) << 2;
+			tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+			palette = ((attrCode & 0x7) << 2) | ((attrCode & 0x80) >> 2);
 			texel = tileYLine;
-			this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-			this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-			this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-			this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-			this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-			this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-			this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-			this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel]];
 		}
 		if (pixelPosition < pixelPositionEnd) {
 			chrCode = this.BGCHRBank1[tileYDown];
@@ -6606,32 +6854,128 @@ GameBoyCore.prototype.BGGBCLayerRender = function () {
 				chrCode |= 0x100;
 			}
 			attrCode = this.BGCHRBank2[tileYDown];
-			chrCode |= ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5);
-			tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBCTile(attrCode, chrCode);
-			pixelFlag = (attrCode << 17) & this.BGPriorityEnabled;
-			palette = (attrCode & 0x7) << 2;
+			tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+			palette = ((attrCode & 0x7) << 2) | ((attrCode & 0x80) >> 2);
 			switch (pixelPositionEnd - pixelPosition) {
 				case 7:
-					this.frameBuffer[pixelPosition + 6] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 6]];
+					this.frameBuffer[pixelPosition + 6] = this.gbcBGPalette[palette | tile[tileYLine | 6]];
 				case 6:
-					this.frameBuffer[pixelPosition + 5] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 5]];
+					this.frameBuffer[pixelPosition + 5] = this.gbcBGPalette[palette | tile[tileYLine | 5]];
 				case 5:
-					this.frameBuffer[pixelPosition + 4] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 4]];
+					this.frameBuffer[pixelPosition + 4] = this.gbcBGPalette[palette | tile[tileYLine | 4]];
 				case 4:
-					this.frameBuffer[pixelPosition + 3] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 3]];
+					this.frameBuffer[pixelPosition + 3] = this.gbcBGPalette[palette | tile[tileYLine | 3]];
 				case 3:
-					this.frameBuffer[pixelPosition + 2] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 2]];
+					this.frameBuffer[pixelPosition + 2] = this.gbcBGPalette[palette | tile[tileYLine | 2]];
 				case 2:
-					this.frameBuffer[pixelPosition + 1] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 1]];
+					this.frameBuffer[pixelPosition + 1] = this.gbcBGPalette[palette | tile[tileYLine | 1]];
 				case 1:
-					this.frameBuffer[pixelPosition] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine]];
+					this.frameBuffer[pixelPosition] = this.gbcBGPalette[palette | tile[tileYLine]];
 			}
 		}
 	}
 }
-GameBoyCore.prototype.WindowGBLayerRender = function () {
+GameBoyCore.prototype.BGGBCLayerRenderNoPriorityFlagging = function (scanlineToRender) {
+	var scrollYAdjusted = (this.backgroundY + scanlineToRender) & 0xFF;						//The line of the BG we're at.
+	var tileYLine = (scrollYAdjusted & 7) << 3;
+	var tileYDown = this.gfxBackgroundCHRBankPosition | ((scrollYAdjusted & 0xF8) << 2);	//The row of cached tiles we're fetching from.
+	var scrollXAdjusted = (this.backgroundX + this.currentX) & 0xFF;						//The scroll amount of the BG.
+	var pixelPosition = this.pixelStart + this.currentX;									//Current pixel we're working on.
+	var pixelPositionEnd = this.pixelStart + ((this.gfxWindowDisplay && (scanlineToRender - this.windowY) >= 0) ? Math.min(Math.max(this.windowX, 0) + this.currentX, this.pixelEnd) : this.pixelEnd);	//Make sure we do at most 160 pixels a scanline.
+	var tileNumber = tileYDown + (scrollXAdjusted >> 3);
+	var chrCode = this.BGCHRBank1[tileNumber];
+	if (chrCode < this.gfxBackgroundBankOffset) {
+		chrCode |= 0x100;
+	}
+	var attrCode = this.BGCHRBank2[tileNumber];
+	var tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+	var palette = (attrCode & 0x7) << 2;
+	for (var texel = (scrollXAdjusted & 0x7); texel < 8 && pixelPosition < pixelPositionEnd && scrollXAdjusted < 0x100; ++scrollXAdjusted) {
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[tileYLine | texel++]];
+	}
+	var scrollXAdjustedAligned = Math.min(pixelPositionEnd - pixelPosition, 0x100 - scrollXAdjusted) >> 3;
+	scrollXAdjusted += scrollXAdjustedAligned << 3;
+	scrollXAdjustedAligned += tileNumber;
+	while (tileNumber < scrollXAdjustedAligned) {
+		chrCode = this.BGCHRBank1[++tileNumber];
+		if (chrCode < this.gfxBackgroundBankOffset) {
+			chrCode |= 0x100;
+		}
+		attrCode = this.BGCHRBank2[tileNumber];
+		tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+		palette = (attrCode & 0x7) << 2;
+		texel = tileYLine;
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+		this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel]];
+	}
+	if (pixelPosition < pixelPositionEnd) {
+		if (scrollXAdjusted < 0x100) {
+			chrCode = this.BGCHRBank1[++tileNumber];
+			if (chrCode < this.gfxBackgroundBankOffset) {
+				chrCode |= 0x100;
+			}
+			attrCode = this.BGCHRBank2[tileNumber];
+			tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+			palette = (attrCode & 0x7) << 2;
+			for (texel = tileYLine - 1; pixelPosition < pixelPositionEnd && scrollXAdjusted < 0x100; ++scrollXAdjusted) {
+				this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[++texel]];
+			}
+		}
+		scrollXAdjustedAligned = ((pixelPositionEnd - pixelPosition) >> 3) + tileYDown;
+		while (tileYDown < scrollXAdjustedAligned) {
+			chrCode = this.BGCHRBank1[tileYDown];
+			if (chrCode < this.gfxBackgroundBankOffset) {
+				chrCode |= 0x100;
+			}
+			attrCode = this.BGCHRBank2[tileYDown++];
+			tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+			palette = (attrCode & 0x7) << 2;
+			texel = tileYLine;
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+			this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel]];
+		}
+		if (pixelPosition < pixelPositionEnd) {
+			chrCode = this.BGCHRBank1[tileYDown];
+			if (chrCode < this.gfxBackgroundBankOffset) {
+				chrCode |= 0x100;
+			}
+			attrCode = this.BGCHRBank2[tileYDown];
+			tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+			palette = (attrCode & 0x7) << 2;
+			switch (pixelPositionEnd - pixelPosition) {
+				case 7:
+					this.frameBuffer[pixelPosition + 6] = this.gbcBGPalette[palette | tile[tileYLine | 6]];
+				case 6:
+					this.frameBuffer[pixelPosition + 5] = this.gbcBGPalette[palette | tile[tileYLine | 5]];
+				case 5:
+					this.frameBuffer[pixelPosition + 4] = this.gbcBGPalette[palette | tile[tileYLine | 4]];
+				case 4:
+					this.frameBuffer[pixelPosition + 3] = this.gbcBGPalette[palette | tile[tileYLine | 3]];
+				case 3:
+					this.frameBuffer[pixelPosition + 2] = this.gbcBGPalette[palette | tile[tileYLine | 2]];
+				case 2:
+					this.frameBuffer[pixelPosition + 1] = this.gbcBGPalette[palette | tile[tileYLine | 1]];
+				case 1:
+					this.frameBuffer[pixelPosition] = this.gbcBGPalette[palette | tile[tileYLine]];
+			}
+		}
+	}
+}
+GameBoyCore.prototype.WindowGBLayerRender = function (scanlineToRender) {
 	if (this.gfxWindowDisplay) {									//Is the window enabled?
-		var scrollYAdjusted = this.actualScanLine - this.windowY;	//The line of the BG we're at.
+		var scrollYAdjusted = scanlineToRender - this.windowY;		//The line of the BG we're at.
 		if (scrollYAdjusted >= 0) {
 			var scrollXRangeAdjusted = (this.windowX > 0) ? (this.windowX + this.currentX) : this.currentX;
 			var pixelPosition = this.pixelStart + scrollXRangeAdjusted;
@@ -6643,7 +6987,7 @@ GameBoyCore.prototype.WindowGBLayerRender = function () {
 				if (chrCode < this.gfxBackgroundBankOffset) {
 					chrCode |= 0x100;
 				}
-				var tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBTile(chrCode);
+				var tile = this.tileCache[chrCode];
 				var texel = (scrollXRangeAdjusted - this.windowX) & 0x7;
 				scrollXRangeAdjusted = Math.min(8, texel + pixelPositionEnd - pixelPosition);
 				while (texel < scrollXRangeAdjusted) {
@@ -6655,7 +6999,7 @@ GameBoyCore.prototype.WindowGBLayerRender = function () {
 					if (chrCode < this.gfxBackgroundBankOffset) {
 						chrCode |= 0x100;
 					}
-					tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBTile(chrCode);
+					tile = this.tileCache[chrCode];
 					texel = tileYLine;
 					this.frameBuffer[pixelPosition++] = this.BGPalette[tile[texel++]];
 					this.frameBuffer[pixelPosition++] = this.BGPalette[tile[texel++]];
@@ -6671,7 +7015,7 @@ GameBoyCore.prototype.WindowGBLayerRender = function () {
 					if (chrCode < this.gfxBackgroundBankOffset) {
 						chrCode |= 0x100;
 					}
-					tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBTile(chrCode);
+					tile = this.tileCache[chrCode];
 					switch (pixelPositionEnd - pixelPosition) {
 						case 7:
 							this.frameBuffer[pixelPosition + 6] = this.BGPalette[tile[tileYLine | 6]];
@@ -6693,9 +7037,9 @@ GameBoyCore.prototype.WindowGBLayerRender = function () {
 		}
 	}
 }
-GameBoyCore.prototype.WindowGBCLayerRender = function () {
+GameBoyCore.prototype.WindowGBCLayerRender = function (scanlineToRender) {
 	if (this.gfxWindowDisplay) {									//Is the window enabled?
-		var scrollYAdjusted = this.actualScanLine - this.windowY;	//The line of the BG we're at.
+		var scrollYAdjusted = scanlineToRender - this.windowY;		//The line of the BG we're at.
 		if (scrollYAdjusted >= 0) {
 			var scrollXRangeAdjusted = (this.windowX > 0) ? (this.windowX + this.currentX) : this.currentX;
 			var pixelPosition = this.pixelStart + scrollXRangeAdjusted;
@@ -6708,14 +7052,12 @@ GameBoyCore.prototype.WindowGBCLayerRender = function () {
 					chrCode |= 0x100;
 				}
 				var attrCode = this.BGCHRBank2[tileNumber];
-				chrCode |= ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5);
-				var tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBCTile(attrCode, chrCode);
-				var pixelFlag = (attrCode << 17) & this.BGPriorityEnabled;
-				var palette = (attrCode & 0x7) << 2;
+				var tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+				var palette = ((attrCode & 0x7) << 2) | ((attrCode & 0x80) >> 2);
 				var texel = (scrollXRangeAdjusted - this.windowX) & 0x7;
 				scrollXRangeAdjusted = Math.min(8, texel + pixelPositionEnd - pixelPosition);
 				while (texel < scrollXRangeAdjusted) {
-					this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[tileYLine | texel++]];
 				}
 				scrollXRangeAdjusted = tileNumber + ((pixelPositionEnd - pixelPosition) >> 3);
 				while (tileNumber < scrollXRangeAdjusted) {
@@ -6724,19 +7066,17 @@ GameBoyCore.prototype.WindowGBCLayerRender = function () {
 						chrCode |= 0x100;
 					}
 					attrCode = this.BGCHRBank2[tileNumber];
-					chrCode |= ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5);
-					tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBCTile(attrCode, chrCode);
-					pixelFlag = (attrCode << 17) & this.BGPriorityEnabled;
-					palette = (attrCode & 0x7) << 2;
+					tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+					palette = ((attrCode & 0x7) << 2) | ((attrCode & 0x80) >> 2);
 					texel = tileYLine;
-					this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-					this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-					this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-					this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-					this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-					this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-					this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel++]];
-					this.frameBuffer[pixelPosition++] = pixelFlag | this.gbcBGPalette[palette | tile[texel]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel]];
 				}
 				if (pixelPosition < pixelPositionEnd) {
 					chrCode = this.BGCHRBank1[++tileNumber];
@@ -6744,138 +7084,144 @@ GameBoyCore.prototype.WindowGBCLayerRender = function () {
 						chrCode |= 0x100;
 					}
 					attrCode = this.BGCHRBank2[tileNumber];
-					chrCode |= ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5);
-					tile = (this.tileCacheValid[chrCode] == 1) ? this.tileCache[chrCode] : this.generateGBCTile(attrCode, chrCode);
-					pixelFlag = (attrCode << 17) & this.BGPriorityEnabled;
-					palette = (attrCode & 0x7) << 2;
+					tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+					palette = ((attrCode & 0x7) << 2) | ((attrCode & 0x80) >> 2);
 					switch (pixelPositionEnd - pixelPosition) {
 						case 7:
-							this.frameBuffer[pixelPosition + 6] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 6]];
+							this.frameBuffer[pixelPosition + 6] = this.gbcBGPalette[palette | tile[tileYLine | 6]];
 						case 6:
-							this.frameBuffer[pixelPosition + 5] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 5]];
+							this.frameBuffer[pixelPosition + 5] = this.gbcBGPalette[palette | tile[tileYLine | 5]];
 						case 5:
-							this.frameBuffer[pixelPosition + 4] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 4]];
+							this.frameBuffer[pixelPosition + 4] = this.gbcBGPalette[palette | tile[tileYLine | 4]];
 						case 4:
-							this.frameBuffer[pixelPosition + 3] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 3]];
+							this.frameBuffer[pixelPosition + 3] = this.gbcBGPalette[palette | tile[tileYLine | 3]];
 						case 3:
-							this.frameBuffer[pixelPosition + 2] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 2]];
+							this.frameBuffer[pixelPosition + 2] = this.gbcBGPalette[palette | tile[tileYLine | 2]];
 						case 2:
-							this.frameBuffer[pixelPosition + 1] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine | 1]];
+							this.frameBuffer[pixelPosition + 1] = this.gbcBGPalette[palette | tile[tileYLine | 1]];
 						case 1:
-							this.frameBuffer[pixelPosition] = pixelFlag | this.gbcBGPalette[palette | tile[tileYLine]];
+							this.frameBuffer[pixelPosition] = this.gbcBGPalette[palette | tile[tileYLine]];
 					}
 				}
 			}
 		}
 	}
 }
-GameBoyCore.prototype.SpriteGBLayerRender = function () {
+GameBoyCore.prototype.WindowGBCLayerRenderNoPriorityFlagging = function (scanlineToRender) {
+	if (this.gfxWindowDisplay) {									//Is the window enabled?
+		var scrollYAdjusted = scanlineToRender - this.windowY;		//The line of the BG we're at.
+		if (scrollYAdjusted >= 0) {
+			var scrollXRangeAdjusted = (this.windowX > 0) ? (this.windowX + this.currentX) : this.currentX;
+			var pixelPosition = this.pixelStart + scrollXRangeAdjusted;
+			var pixelPositionEnd = this.pixelStart + this.pixelEnd;
+			if (pixelPosition < pixelPositionEnd) {
+				var tileYLine = (scrollYAdjusted & 0x7) << 3;
+				var tileNumber = (this.gfxWindowCHRBankPosition | ((scrollYAdjusted & 0xF8) << 2)) + (this.currentX >> 3);
+				var chrCode = this.BGCHRBank1[tileNumber];
+				if (chrCode < this.gfxBackgroundBankOffset) {
+					chrCode |= 0x100;
+				}
+				var attrCode = this.BGCHRBank2[tileNumber];
+				var tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+				var palette = (attrCode & 0x7) << 2;
+				var texel = (scrollXRangeAdjusted - this.windowX) & 0x7;
+				scrollXRangeAdjusted = Math.min(8, texel + pixelPositionEnd - pixelPosition);
+				while (texel < scrollXRangeAdjusted) {
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[tileYLine | texel++]];
+				}
+				scrollXRangeAdjusted = tileNumber + ((pixelPositionEnd - pixelPosition) >> 3);
+				while (tileNumber < scrollXRangeAdjusted) {
+					chrCode = this.BGCHRBank1[++tileNumber];
+					if (chrCode < this.gfxBackgroundBankOffset) {
+						chrCode |= 0x100;
+					}
+					attrCode = this.BGCHRBank2[tileNumber];
+					tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+					palette = (attrCode & 0x7) << 2;
+					texel = tileYLine;
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel++]];
+					this.frameBuffer[pixelPosition++] = this.gbcBGPalette[palette | tile[texel]];
+				}
+				if (pixelPosition < pixelPositionEnd) {
+					chrCode = this.BGCHRBank1[++tileNumber];
+					if (chrCode < this.gfxBackgroundBankOffset) {
+						chrCode |= 0x100;
+					}
+					attrCode = this.BGCHRBank2[tileNumber];
+					tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | chrCode];
+					palette = (attrCode & 0x7) << 2;
+					switch (pixelPositionEnd - pixelPosition) {
+						case 7:
+							this.frameBuffer[pixelPosition + 6] = this.gbcBGPalette[palette | tile[tileYLine | 6]];
+						case 6:
+							this.frameBuffer[pixelPosition + 5] = this.gbcBGPalette[palette | tile[tileYLine | 5]];
+						case 5:
+							this.frameBuffer[pixelPosition + 4] = this.gbcBGPalette[palette | tile[tileYLine | 4]];
+						case 4:
+							this.frameBuffer[pixelPosition + 3] = this.gbcBGPalette[palette | tile[tileYLine | 3]];
+						case 3:
+							this.frameBuffer[pixelPosition + 2] = this.gbcBGPalette[palette | tile[tileYLine | 2]];
+						case 2:
+							this.frameBuffer[pixelPosition + 1] = this.gbcBGPalette[palette | tile[tileYLine | 1]];
+						case 1:
+							this.frameBuffer[pixelPosition] = this.gbcBGPalette[palette | tile[tileYLine]];
+					}
+				}
+			}
+		}
+	}
+}
+GameBoyCore.prototype.SpriteGBLayerRender = function (scanlineToRender) {
 	if (this.gfxSpriteShow) {										//Are sprites enabled?
-		var lineAdjusted = this.actualScanLine + 0x10;
+		var lineAdjusted = scanlineToRender + 0x10;
 		var OAMAddress = 0xFE00;
 		var yoffset = 0;
-		var xcoord = 0;
+		var xcoord = 1;
+		var xCoordStart = 0;
+		var xCoordEnd = 0;
 		var attrCode = 0;
 		var palette = 0;
-		var tileNumber = 0;
 		var tile = null;
 		var data = 0;
 		var spriteCount = 0;
-		var currentColumn = 0;
 		var length = 0;
 		var currentPixel = 0;
-		var onXCoord = 1;
-		var pixelOffsetLocal = this.pixelStart;
+		var linePixel = 0;
+		//Clear our x-coord sort buffer:
+		while (xcoord < 168) {
+			this.sortBuffer[xcoord++] = 0xFF;
+		}
 		if (this.gfxSpriteNormalHeight) {
 			//Draw the visible sprites:
-			for (var lowestSpriteAddress = this.findLowestSpriteDrawable(); onXCoord < 8; ++onXCoord) {
-				currentColumn = this.OAMAddresses[onXCoord];
-				length = currentColumn.length;
-				for (spriteCount = 0; spriteCount < length; ++spriteCount) {
-					OAMAddress = currentColumn[spriteCount];
-					if (OAMAddress < lowestSpriteAddress) {
-						yoffset = lineAdjusted - this.memory[OAMAddress];
-						if ((yoffset & 0x7) == yoffset) {
-							yoffset <<= 3;
-							attrCode = this.memory[OAMAddress | 3];
-							palette = (attrCode & 0x10) >> 2;
-							tileNumber = ((attrCode & 0x60) << 4) | this.memory[OAMAddress | 0x2];
-							tile = (this.tileCacheValid[tileNumber] == 1) ? this.tileCache[tileNumber] : this.generateGBOAMTile(attrCode, tileNumber);
-							for (xcoord = 8 - onXCoord, currentPixel = pixelOffsetLocal; xcoord < 8; ++xcoord, ++currentPixel) {
-								if (this.frameBuffer[currentPixel] >= 0x2000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
-								else if (this.frameBuffer[currentPixel] < 0x1000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0 && attrCode < 0x80) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
+			for (var length = this.findLowestSpriteDrawable(lineAdjusted, 0x7); spriteCount < length; ++spriteCount) {
+				OAMAddress = this.OAMAddressCache[spriteCount];
+				yoffset = (lineAdjusted - this.memory[OAMAddress]) << 3;
+				attrCode = this.memory[OAMAddress | 3];
+				palette = (attrCode & 0x10) >> 2;
+				tile = this.tileCache[((attrCode & 0x60) << 4) | this.memory[OAMAddress | 0x2]];
+				linePixel = xCoordStart = this.memory[OAMAddress | 1];
+				xCoordEnd = Math.min(168 - linePixel, 8);
+				xcoord = (linePixel > 7) ? 0 : (8 - linePixel);
+				for (currentPixel = this.pixelStart + ((linePixel > 8) ? (linePixel - 8) : 0); xcoord < xCoordEnd; ++xcoord, ++currentPixel, ++linePixel) {	
+					if (this.sortBuffer[linePixel] > xCoordStart) {
+						if (this.frameBuffer[currentPixel] >= 0x2000000) {
+							data = tile[yoffset | xcoord];
+							if (data > 0) {
+								this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
+								this.sortBuffer[linePixel] = xCoordStart;
 							}
 						}
-					}
-				}
-			}
-			for (pixelOffsetLocal -= 8; onXCoord < 161; ++onXCoord) {
-				currentColumn = this.OAMAddresses[onXCoord];
-				length = currentColumn.length;
-				for (spriteCount = 0; spriteCount < length; ++spriteCount) {
-					OAMAddress = currentColumn[spriteCount];
-					if (OAMAddress < lowestSpriteAddress) {
-						yoffset = lineAdjusted - this.memory[OAMAddress];
-						if ((yoffset & 0x7) == yoffset) {
-							yoffset <<= 3;
-							attrCode = this.memory[OAMAddress | 3];
-							palette = (attrCode & 0x10) >> 2;
-							tileNumber = ((attrCode & 0x60) << 4) | this.memory[OAMAddress | 0x2];
-							tile = (this.tileCacheValid[tileNumber] == 1) ? this.tileCache[tileNumber] : this.generateGBOAMTile(attrCode, tileNumber);
-							for (xcoord = 0, currentPixel = pixelOffsetLocal + onXCoord; xcoord < 8; ++xcoord, ++currentPixel) {
-								if (this.frameBuffer[currentPixel] >= 0x2000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
-								else if (this.frameBuffer[currentPixel] < 0x1000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0 && attrCode < 0x80) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-			for (pixelOffsetLocal += 167; onXCoord < 168; ++onXCoord) {
-				currentColumn = this.OAMAddresses[onXCoord];
-				length = currentColumn.length;
-				for (spriteCount = 0; spriteCount < length; ++spriteCount) {
-					OAMAddress = currentColumn[spriteCount];
-					if (OAMAddress < lowestSpriteAddress) {
-						yoffset = lineAdjusted - this.memory[OAMAddress];
-						if ((yoffset & 0x7) == yoffset) {
-							yoffset <<= 3;
-							attrCode = this.memory[OAMAddress | 3];
-							palette = (attrCode & 0x10) >> 2;
-							tileNumber = ((attrCode & 0x60) << 4) | this.memory[OAMAddress | 0x2];
-							tile = (this.tileCacheValid[tileNumber] == 1) ? this.tileCache[tileNumber] : this.generateGBOAMTile(attrCode, tileNumber);
-							for (xcoord = 167 - onXCoord, currentPixel = pixelOffsetLocal; xcoord > -1; --xcoord, --currentPixel) {
-								if (this.frameBuffer[currentPixel] >= 0x2000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
-								else if (this.frameBuffer[currentPixel] < 0x1000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0 && attrCode < 0x80) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
+						else if (this.frameBuffer[currentPixel] < 0x1000000) {
+							data = tile[yoffset | xcoord];
+							if (data > 0 && attrCode < 0x80) {
+								this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
+								this.sortBuffer[linePixel] = xCoordStart;
 							}
 						}
 					}
@@ -6884,109 +7230,35 @@ GameBoyCore.prototype.SpriteGBLayerRender = function () {
 		}
 		else {
 			//Draw the visible sprites:
-			for (var lowestSpriteAddress = this.findLowestSpriteDoubleDrawable(); onXCoord < 8; ++onXCoord) {
-				currentColumn = this.OAMAddresses[onXCoord];
-				length = currentColumn.length;
-				for (spriteCount = 0; spriteCount < length; ++spriteCount) {
-					OAMAddress = currentColumn[spriteCount];
-					if (OAMAddress < lowestSpriteAddress) {
-						yoffset = lineAdjusted - this.memory[OAMAddress];
-						if ((yoffset & 0xF) == yoffset) {
-							attrCode = this.memory[OAMAddress | 0x3];
-							palette = (attrCode & 0x10) >> 2;
-							if ((attrCode & 0x40) == (0x40 & (yoffset << 3))) {
-								tileNumber = ((attrCode & 0x60) << 4) | (this.memory[OAMAddress | 0x2] & 0xFE);
-							}
-							else {
-								tileNumber = ((attrCode & 0x60) << 4) | this.memory[OAMAddress | 0x2] | 1;
-							}
-							yoffset = (yoffset & 0x7) << 3;
-							tile = (this.tileCacheValid[tileNumber] == 1) ? this.tileCache[tileNumber] : this.generateGBOAMTile(attrCode, tileNumber);
-							for (xcoord = 8 - onXCoord, currentPixel = pixelOffsetLocal; xcoord < 8; ++xcoord, ++currentPixel) {
-								if (this.frameBuffer[currentPixel] >= 0x2000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
-								else if (this.frameBuffer[currentPixel] < 0x1000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0 && attrCode < 0x80) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
+			for (var length = this.findLowestSpriteDrawable(lineAdjusted, 0xF); spriteCount < length; ++spriteCount) {
+				OAMAddress = this.OAMAddressCache[spriteCount];
+				yoffset = (lineAdjusted - this.memory[OAMAddress]) << 3;
+				attrCode = this.memory[OAMAddress | 3];
+				palette = (attrCode & 0x10) >> 2;
+				if ((attrCode & 0x40) == (0x40 & yoffset)) {
+					tile = this.tileCache[((attrCode & 0x60) << 4) | (this.memory[OAMAddress | 0x2] & 0xFE)];
+				}
+				else {
+					tile = this.tileCache[((attrCode & 0x60) << 4) | this.memory[OAMAddress | 0x2] | 1];
+				}
+				yoffset &= 0x3F;
+				linePixel = xCoordStart = this.memory[OAMAddress | 1];
+				xCoordEnd = Math.min(168 - linePixel, 8);
+				xcoord = (linePixel > 7) ? 0 : (8 - linePixel);
+				for (currentPixel = this.pixelStart + ((linePixel > 8) ? (linePixel - 8) : 0); xcoord < xCoordEnd; ++xcoord, ++currentPixel, ++linePixel) {	
+					if (this.sortBuffer[linePixel] > xCoordStart) {
+						if (this.frameBuffer[currentPixel] >= 0x2000000) {
+							data = tile[yoffset | xcoord];
+							if (data > 0) {
+								this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
+								this.sortBuffer[linePixel] = xCoordStart;
 							}
 						}
-					}
-				}
-			}
-			for (pixelOffsetLocal -= 8; onXCoord < 161; ++onXCoord) {
-				currentColumn = this.OAMAddresses[onXCoord];
-				length = currentColumn.length;
-				for (spriteCount = 0; spriteCount < length; ++spriteCount) {
-					OAMAddress = currentColumn[spriteCount];
-					if (OAMAddress < lowestSpriteAddress) {
-						yoffset = lineAdjusted - this.memory[OAMAddress];
-						if ((yoffset & 0xF) == yoffset) {
-							attrCode = this.memory[OAMAddress | 0x3];
-							palette = (attrCode & 0x10) >> 2;
-							if ((attrCode & 0x40) == (0x40 & (yoffset << 3))) {
-								tileNumber = ((attrCode & 0x60) << 4) | (this.memory[OAMAddress | 0x2] & 0xFE);
-							}
-							else {
-								tileNumber = ((attrCode & 0x60) << 4) | this.memory[OAMAddress | 0x2] | 1;
-							}
-							yoffset = (yoffset & 0x7) << 3;
-							tile = (this.tileCacheValid[tileNumber] == 1) ? this.tileCache[tileNumber] : this.generateGBOAMTile(attrCode, tileNumber);
-							for (xcoord = 0, currentPixel = pixelOffsetLocal + onXCoord; xcoord < 8; ++xcoord, ++currentPixel) {
-								if (this.frameBuffer[currentPixel] >= 0x2000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
-								else if (this.frameBuffer[currentPixel] < 0x1000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0 && attrCode < 0x80) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-			for (pixelOffsetLocal += 167; onXCoord < 168; ++onXCoord) {
-				currentColumn = this.OAMAddresses[onXCoord];
-				length = currentColumn.length;
-				for (spriteCount = 0; spriteCount < length; ++spriteCount) {
-					OAMAddress = currentColumn[spriteCount];
-					if (OAMAddress < lowestSpriteAddress) {
-						yoffset = lineAdjusted - this.memory[OAMAddress];
-						if ((yoffset & 0xF) == yoffset) {
-							attrCode = this.memory[OAMAddress | 0x3];
-							palette = (attrCode & 0x10) >> 2;
-							if ((attrCode & 0x40) == (0x40 & (yoffset << 3))) {
-								tileNumber = ((attrCode & 0x60) << 4) | (this.memory[OAMAddress | 0x2] & 0xFE);
-							}
-							else {
-								tileNumber = ((attrCode & 0x60) << 4) | this.memory[OAMAddress | 0x2] | 1;
-							}
-							yoffset = (yoffset & 0x7) << 3;
-							tile = (this.tileCacheValid[tileNumber] == 1) ? this.tileCache[tileNumber] : this.generateGBOAMTile(attrCode, tileNumber);
-							for (xcoord = 167 - onXCoord, currentPixel = pixelOffsetLocal; xcoord > -1; --xcoord, --currentPixel) {
-								if (this.frameBuffer[currentPixel] >= 0x2000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
-								else if (this.frameBuffer[currentPixel] < 0x1000000) {
-									data = tile[yoffset | xcoord];
-									if (data > 0 && attrCode < 0x80) {
-										this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
-									}
-								}
+						else if (this.frameBuffer[currentPixel] < 0x1000000) {
+							data = tile[yoffset | xcoord];
+							if (data > 0 && attrCode < 0x80) {
+								this.frameBuffer[currentPixel] = this.OBJPalette[palette | data];
+								this.sortBuffer[linePixel] = xCoordStart;
 							}
 						}
 					}
@@ -6995,58 +7267,42 @@ GameBoyCore.prototype.SpriteGBLayerRender = function () {
 		}
 	}
 }
-GameBoyCore.prototype.findLowestSpriteDrawable = function () {
+GameBoyCore.prototype.findLowestSpriteDrawable = function (scanlineToRender, drawableRange) {
 	var address = 0xFE00;
 	var spriteCount = 0;
-	var line = this.actualScanLine + 0x10;
 	var diff = 0;
 	while (address < 0xFEA0 && spriteCount < 10) {
-		diff = line - this.memory[address];
-		if (diff > -1 && diff < 0x8) {
-			++spriteCount;
+		diff = scanlineToRender - this.memory[address];
+		if ((diff & drawableRange) == diff) {
+			this.OAMAddressCache[spriteCount++] = address;
 		}
 		address += 4;
 	}
-	return address;
+	return spriteCount;
 }
-GameBoyCore.prototype.findLowestSpriteDoubleDrawable = function () {
-	var address = 0xFE00;
-	var spriteCount = 0;
-	var line = this.actualScanLine + 0x10;
-	var diff = 0;
-	while (address < 0xFEA0 && spriteCount < 10) {
-		diff = line - this.memory[address];
-		if (diff > -1 && diff < 0x10) {
-			++spriteCount;
-		}
-		address += 4;
-	}
-	return address;
-}
-GameBoyCore.prototype.SpriteGBCLayerRender = function () {
+GameBoyCore.prototype.SpriteGBCLayerRender = function (scanlineToRender) {
 	if (this.gfxSpriteShow) {										//Are sprites enabled?
 		var OAMAddress = 0xFE00;
-		var lineAdjusted = this.actualScanLine + 0x10;
+		var lineAdjusted = scanlineToRender + 0x10;
 		var yoffset = 0;
 		var xcoord = 0;
 		var endX = 0;
 		var xCounter = 0;
 		var attrCode = 0;
 		var palette = 0;
-		var tileNumber = 0;
 		var tile = null;
 		var data = 0;
 		var currentPixel = 0;
+		var spriteCount = 0;
 		if (this.gfxSpriteNormalHeight) {
-			for (; OAMAddress < 0xFEA0 && this.spriteCount < 312; OAMAddress += 4) {
+			for (; OAMAddress < 0xFEA0 && spriteCount < 10; OAMAddress += 4) {
 				yoffset = lineAdjusted - this.memory[OAMAddress];
 				if ((yoffset & 0x7) == yoffset) {
 					xcoord = this.memory[OAMAddress | 1] - 8;
 					endX = Math.min(160, xcoord + 8);
 					attrCode = this.memory[OAMAddress | 3];
 					palette = (attrCode & 7) << 2;
-					tileNumber = ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5) | this.memory[OAMAddress | 2];
-					tile = ((this.tileCacheValid[tileNumber] == 1) ? this.tileCache[tileNumber] : this.generateGBCTile(attrCode, tileNumber));
+					tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | this.memory[OAMAddress | 2]];
 					xCounter = (xcoord > 0) ? xcoord : 0;
 					xcoord -= yoffset << 3;
 					for (currentPixel = this.pixelStart + xCounter; xCounter < endX; ++xCounter, ++currentPixel) {
@@ -7063,12 +7319,12 @@ GameBoyCore.prototype.SpriteGBCLayerRender = function () {
 							}
 						}
 					}
-					this.spriteCount += 6;
+					++spriteCount;
 				}
 			}
 		}
 		else {
-			for (; OAMAddress < 0xFEA0 && this.spriteCount < 312; OAMAddress += 4) {
+			for (; OAMAddress < 0xFEA0 && spriteCount < 10; OAMAddress += 4) {
 				yoffset = lineAdjusted - this.memory[OAMAddress];
 				if ((yoffset & 0xF) == yoffset) {
 					xcoord = this.memory[OAMAddress | 1] - 8;
@@ -7076,12 +7332,11 @@ GameBoyCore.prototype.SpriteGBCLayerRender = function () {
 					attrCode = this.memory[OAMAddress | 3];
 					palette = (attrCode & 7) << 2;
 					if ((attrCode & 0x40) == (0x40 & (yoffset << 3))) {
-						tileNumber = ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5) | (this.memory[OAMAddress | 0x2] & 0xFE);
+						tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | (this.memory[OAMAddress | 0x2] & 0xFE)];
 					}
 					else {
-						tileNumber = ((attrCode & 0x08) << 6) | ((attrCode & 0x60) << 5) | this.memory[OAMAddress | 0x2] | 1;
+						tile = this.tileCache[((attrCode & 0x08) << 8) | ((attrCode & 0x60) << 4) | this.memory[OAMAddress | 0x2] | 1];
 					}
-					tile = ((this.tileCacheValid[tileNumber] == 1) ? this.tileCache[tileNumber] : this.generateGBCTile(attrCode, tileNumber));
 					xCounter = (xcoord > 0) ? xcoord : 0;
 					xcoord -= (yoffset & 0x7) << 3;
 					for (currentPixel = this.pixelStart + xCounter; xCounter < endX; ++xCounter, ++currentPixel) {
@@ -7098,46 +7353,16 @@ GameBoyCore.prototype.SpriteGBCLayerRender = function () {
 							}
 						}
 					}
-					this.spriteCount += 6;
+					++spriteCount;
 				}
 			}
 		}
 	}
 }
-//Generate a tile for the tile cache for DMG's BG+WINDOW:
-GameBoyCore.prototype.generateGBTile = function (tile) {
-	//Set lookup address to the beginning of the target tile:
-	var address = 0x8000 | (tile << 4);
-	//Get a reference to the tile:
-	var tileBlock = this.tileCache[tile];
-	//Data only from bank 0 with no flipping:
-	var lineIndex = 0;
-	var lineCopy = 0;
-	do {
-		//Copy the two bytes that make up a tile's line:
-		lineCopy = (this.memory[0x1 | address] << 8) | this.memory[address];
-		//Each pixel is composed of two bits: MSB is in the second byte, while the LSB is in the first byte.
-		//Normal copy (no flip) for a line is in the RTL (right-to-left) format:
-		tileBlock[lineIndex | 7] = ((lineCopy & 0x100) >> 7) | (lineCopy & 0x1);
-		tileBlock[lineIndex | 6] = ((lineCopy & 0x200) >> 8) | ((lineCopy & 0x2) >> 1);
-		tileBlock[lineIndex | 5] = ((lineCopy & 0x400) >> 9) | ((lineCopy & 0x4) >> 2);
-		tileBlock[lineIndex | 4] = ((lineCopy & 0x800) >> 10) | ((lineCopy & 0x8) >> 3);
-		tileBlock[lineIndex | 3] = ((lineCopy & 0x1000) >> 11) | ((lineCopy & 0x10) >> 4);
-		tileBlock[lineIndex | 2] = ((lineCopy & 0x2000) >> 12) | ((lineCopy & 0x20) >> 5);
-		tileBlock[lineIndex | 1] = ((lineCopy & 0x4000) >> 13) | ((lineCopy & 0x40) >> 6);
-		tileBlock[lineIndex] = ((lineCopy & 0x8000) >> 14) | ((lineCopy & 0x80) >> 7);
-		address += 2;
-		lineIndex += 8;
-	} while (lineIndex < 64);
-	//Set flag for the tile in the cache to valid:
-	this.tileCacheValid[tile] = 1;
-	//Return the obtained tile to the rendering path:
-	return tileBlock;
-}
 //Generate only a single tile line for the GB tile cache mode:
-/*GameBoyCore.prototype.generateGBTileLine = function (address) {
-	var tileBlock = this.tileCache[(address & 0x1FFE) >> 1];
+GameBoyCore.prototype.generateGBTileLine = function (address) {
 	var lineCopy = (this.memory[0x1 | address] << 8) | this.memory[0x9FFE & address];
+	var tileBlock = this.tileCache[(address & 0x1FF0) >> 4];
 	address = (address & 0xE) << 2;
 	tileBlock[address | 7] = ((lineCopy & 0x100) >> 7) | (lineCopy & 0x1);
 	tileBlock[address | 6] = ((lineCopy & 0x200) >> 8) | ((lineCopy & 0x2) >> 1);
@@ -7147,132 +7372,156 @@ GameBoyCore.prototype.generateGBTile = function (tile) {
 	tileBlock[address | 2] = ((lineCopy & 0x2000) >> 12) | ((lineCopy & 0x20) >> 5);
 	tileBlock[address | 1] = ((lineCopy & 0x4000) >> 13) | ((lineCopy & 0x40) >> 6);
 	tileBlock[address] = ((lineCopy & 0x8000) >> 14) | ((lineCopy & 0x80) >> 7);
-}*/
-//Generate a tile for the tile cache for all CGB graphics planes:
-GameBoyCore.prototype.generateGBCTile = function (map, tile) {
-	var tileBlock = this.tileCache[tile];	//Reference to the 8x8 tile.
-	var tileRawLine = 0;					//Unconverted line data.
-	if ((map & 8) == 0) {
-		//Start address of the tile:
-		var address = 0x8000 | ((tile & 0x1FF) << 4);
-		//Set the copy address as bank 0:
-		var memoryBank = this.memory;
-	}
-	else {
-		//Start address of the tile:
-		var address = (tile & 0x1FF) << 4;
-		//Set the copy address as bank 1:
-		var memoryBank = this.VRAM;
-	}
-	//Some tile flipping initialization:
-	if ((map & 0x40) == 0x40) {
-		//Normal Y:
-		var y = 56;
-		var yINC = -8;
-	}
-	else {
-		//Flipped Y:
-		var y = 0;
-		var yINC = 8;
-	}
-	var lineIndex = 0;
-	if ((map & 0x20) == 0) {
-		//Normal X:
-		do {
-			//Copy the new tile data:
-			tileRawLine = (memoryBank[address | 0x1] << 8) | memoryBank[address];
-			//Each pixel is composed of two bits: MSB is in the second byte, while the LSB is in the first byte.
-			tileBlock[y | 7] = ((tileRawLine & 0x100) >> 7) | (tileRawLine & 0x1);
-			tileBlock[y | 6] = ((tileRawLine & 0x200) >> 8) | ((tileRawLine & 0x2) >> 1);
-			tileBlock[y | 5] = ((tileRawLine & 0x400) >> 9) | ((tileRawLine & 0x4) >> 2);
-			tileBlock[y | 4] = ((tileRawLine & 0x800) >> 10) | ((tileRawLine & 0x8) >> 3);
-			tileBlock[y | 3] = ((tileRawLine & 0x1000) >> 11) | ((tileRawLine & 0x10) >> 4);
-			tileBlock[y | 2] = ((tileRawLine & 0x2000) >> 12) | ((tileRawLine & 0x20) >> 5);
-			tileBlock[y | 1] = ((tileRawLine & 0x4000) >> 13) | ((tileRawLine & 0x40) >> 6);
-			tileBlock[y] = ((tileRawLine & 0x8000) >> 14) | ((tileRawLine & 0x80) >> 7);
-			y += yINC;
-			address += 2;
-		} while (++lineIndex < 8);
-	}
-	else {
-		//Flipped X:
-		do {
-			//Copy the new tile data:
-			tileRawLine = (memoryBank[address | 0x1] << 8) | memoryBank[address];
-			//Each pixel is composed of two bits: MSB is in the second byte, while the LSB is in the first byte.
-			tileBlock[y] = ((tileRawLine & 0x100) >> 7) | (tileRawLine & 0x1);
-			tileBlock[y | 1] = ((tileRawLine & 0x200) >> 8) | ((tileRawLine & 0x2) >> 1);
-			tileBlock[y | 2] = ((tileRawLine & 0x400) >> 9) | ((tileRawLine & 0x4) >> 2);
-			tileBlock[y | 3] = ((tileRawLine & 0x800) >> 10) | ((tileRawLine & 0x8) >> 3);
-			tileBlock[y | 4] = ((tileRawLine & 0x1000) >> 11) | ((tileRawLine & 0x10) >> 4);
-			tileBlock[y | 5] = ((tileRawLine & 0x2000) >> 12) | ((tileRawLine & 0x20) >> 5);
-			tileBlock[y | 6] = ((tileRawLine & 0x4000) >> 13) | ((tileRawLine & 0x40) >> 6);
-			tileBlock[y | 7] = ((tileRawLine & 0x8000) >> 14) | ((tileRawLine & 0x80) >> 7);
-			y += yINC;
-			address += 2;
-		} while (++lineIndex < 8);
-	}
-	//Set flag for the tile in the cache to valid:
-	this.tileCacheValid[tile] = 1;
-	//Return the obtained tile to the rendering path:
-	return tileBlock;
 }
-//Generate a tile for the tile cache for DMG's sprites:
-GameBoyCore.prototype.generateGBOAMTile = function (map, tile) {
-	var address = 0x8000 | ((tile & 0x1FF) << 4);	//Start address of the tile.
-	var tileBlock = this.tileCache[tile];			//Reference to the 8x8 tile.
-	var tileRawLine = 0;							//Unconverted line data.
-	if ((map & 0x40) == 0x40) {
-		//Normal Y:
-		var y = 56;
-		var yINC = -8;
+//Generate only a single tile line for the GBC tile cache mode (Bank 1):
+GameBoyCore.prototype.generateGBCTileLineBank1 = function (address) {
+	var lineCopy = (this.memory[0x1 | address] << 8) | this.memory[0x9FFE & address];
+	address &= 0x1FFE;
+	var tileBlock1 = this.tileCache[address >> 4];
+	var tileBlock2 = this.tileCache[0x200 | (address >> 4)];
+	var tileBlock3 = this.tileCache[0x400 | (address >> 4)];
+	var tileBlock4 = this.tileCache[0x600 | (address >> 4)];
+	address = (address & 0xE) << 2;
+	var addressFlipped = 0x38 - address;
+	tileBlock4[addressFlipped] = tileBlock2[address] = tileBlock3[addressFlipped | 7] = tileBlock1[address | 7] = ((lineCopy & 0x100) >> 7) | (lineCopy & 0x1);
+	tileBlock4[addressFlipped | 1] = tileBlock2[address | 1] = tileBlock3[addressFlipped | 6] = tileBlock1[address | 6] = ((lineCopy & 0x200) >> 8) | ((lineCopy & 0x2) >> 1);
+	tileBlock4[addressFlipped | 2] = tileBlock2[address | 2] = tileBlock3[addressFlipped | 5] = tileBlock1[address | 5] = ((lineCopy & 0x400) >> 9) | ((lineCopy & 0x4) >> 2);
+	tileBlock4[addressFlipped | 3] = tileBlock2[address | 3] = tileBlock3[addressFlipped | 4] = tileBlock1[address | 4] = ((lineCopy & 0x800) >> 10) | ((lineCopy & 0x8) >> 3);
+	tileBlock4[addressFlipped | 4] = tileBlock2[address | 4] = tileBlock3[addressFlipped | 3] = tileBlock1[address | 3] = ((lineCopy & 0x1000) >> 11) | ((lineCopy & 0x10) >> 4);
+	tileBlock4[addressFlipped | 5] = tileBlock2[address | 5] = tileBlock3[addressFlipped | 2] = tileBlock1[address | 2] = ((lineCopy & 0x2000) >> 12) | ((lineCopy & 0x20) >> 5);
+	tileBlock4[addressFlipped | 6] = tileBlock2[address | 6] = tileBlock3[addressFlipped | 1] = tileBlock1[address | 1] = ((lineCopy & 0x4000) >> 13) | ((lineCopy & 0x40) >> 6);
+	tileBlock4[addressFlipped | 7] = tileBlock2[address | 7] = tileBlock3[addressFlipped] = tileBlock1[address] = ((lineCopy & 0x8000) >> 14) | ((lineCopy & 0x80) >> 7);
+}
+//Generate all the flip combinations for a full GBC VRAM bank 1 tile:
+GameBoyCore.prototype.generateGBCTileBank1 = function (vramAddress) {
+	var address = vramAddress >> 4;
+	var tileBlock1 = this.tileCache[address];
+	var tileBlock2 = this.tileCache[0x200 | address];
+	var tileBlock3 = this.tileCache[0x400 | address];
+	var tileBlock4 = this.tileCache[0x600 | address];
+	var lineCopy = 0;
+	vramAddress |= 0x8000;
+	address = 0;
+	var addressFlipped = 56;
+	do {
+		lineCopy = (this.memory[0x1 | vramAddress] << 8) | this.memory[vramAddress];
+		tileBlock4[addressFlipped] = tileBlock2[address] = tileBlock3[addressFlipped | 7] = tileBlock1[address | 7] = ((lineCopy & 0x100) >> 7) | (lineCopy & 0x1);
+		tileBlock4[addressFlipped | 1] = tileBlock2[address | 1] = tileBlock3[addressFlipped | 6] = tileBlock1[address | 6] = ((lineCopy & 0x200) >> 8) | ((lineCopy & 0x2) >> 1);
+		tileBlock4[addressFlipped | 2] = tileBlock2[address | 2] = tileBlock3[addressFlipped | 5] = tileBlock1[address | 5] = ((lineCopy & 0x400) >> 9) | ((lineCopy & 0x4) >> 2);
+		tileBlock4[addressFlipped | 3] = tileBlock2[address | 3] = tileBlock3[addressFlipped | 4] = tileBlock1[address | 4] = ((lineCopy & 0x800) >> 10) | ((lineCopy & 0x8) >> 3);
+		tileBlock4[addressFlipped | 4] = tileBlock2[address | 4] = tileBlock3[addressFlipped | 3] = tileBlock1[address | 3] = ((lineCopy & 0x1000) >> 11) | ((lineCopy & 0x10) >> 4);
+		tileBlock4[addressFlipped | 5] = tileBlock2[address | 5] = tileBlock3[addressFlipped | 2] = tileBlock1[address | 2] = ((lineCopy & 0x2000) >> 12) | ((lineCopy & 0x20) >> 5);
+		tileBlock4[addressFlipped | 6] = tileBlock2[address | 6] = tileBlock3[addressFlipped | 1] = tileBlock1[address | 1] = ((lineCopy & 0x4000) >> 13) | ((lineCopy & 0x40) >> 6);
+		tileBlock4[addressFlipped | 7] = tileBlock2[address | 7] = tileBlock3[addressFlipped] = tileBlock1[address] = ((lineCopy & 0x8000) >> 14) | ((lineCopy & 0x80) >> 7);
+		address += 8;
+		addressFlipped -= 8;
+		vramAddress += 2;
+	} while (addressFlipped > -1);
+}
+//Generate only a single tile line for the GBC tile cache mode (Bank 2):
+GameBoyCore.prototype.generateGBCTileLineBank2 = function (address) {
+	var lineCopy = (this.VRAM[0x1 | address] << 8) | this.VRAM[0x1FFE & address];
+	var tileBlock1 = this.tileCache[0x800 | (address >> 4)];
+	var tileBlock2 = this.tileCache[0xA00 | (address >> 4)];
+	var tileBlock3 = this.tileCache[0xC00 | (address >> 4)];
+	var tileBlock4 = this.tileCache[0xE00 | (address >> 4)];
+	address = (address & 0xE) << 2;
+	var addressFlipped = 0x38 - address;
+	tileBlock4[addressFlipped] = tileBlock2[address] = tileBlock3[addressFlipped | 7] = tileBlock1[address | 7] = ((lineCopy & 0x100) >> 7) | (lineCopy & 0x1);
+	tileBlock4[addressFlipped | 1] = tileBlock2[address | 1] = tileBlock3[addressFlipped | 6] = tileBlock1[address | 6] = ((lineCopy & 0x200) >> 8) | ((lineCopy & 0x2) >> 1);
+	tileBlock4[addressFlipped | 2] = tileBlock2[address | 2] = tileBlock3[addressFlipped | 5] = tileBlock1[address | 5] = ((lineCopy & 0x400) >> 9) | ((lineCopy & 0x4) >> 2);
+	tileBlock4[addressFlipped | 3] = tileBlock2[address | 3] = tileBlock3[addressFlipped | 4] = tileBlock1[address | 4] = ((lineCopy & 0x800) >> 10) | ((lineCopy & 0x8) >> 3);
+	tileBlock4[addressFlipped | 4] = tileBlock2[address | 4] = tileBlock3[addressFlipped | 3] = tileBlock1[address | 3] = ((lineCopy & 0x1000) >> 11) | ((lineCopy & 0x10) >> 4);
+	tileBlock4[addressFlipped | 5] = tileBlock2[address | 5] = tileBlock3[addressFlipped | 2] = tileBlock1[address | 2] = ((lineCopy & 0x2000) >> 12) | ((lineCopy & 0x20) >> 5);
+	tileBlock4[addressFlipped | 6] = tileBlock2[address | 6] = tileBlock3[addressFlipped | 1] = tileBlock1[address | 1] = ((lineCopy & 0x4000) >> 13) | ((lineCopy & 0x40) >> 6);
+	tileBlock4[addressFlipped | 7] = tileBlock2[address | 7] = tileBlock3[addressFlipped] = tileBlock1[address] = ((lineCopy & 0x8000) >> 14) | ((lineCopy & 0x80) >> 7);
+}
+//Generate all the flip combinations for a full GBC VRAM bank 2 tile:
+GameBoyCore.prototype.generateGBCTileBank2 = function (vramAddress) {
+	var address = vramAddress >> 4;	
+	var tileBlock1 = this.tileCache[0x800 | address];
+	var tileBlock2 = this.tileCache[0xA00 | address];
+	var tileBlock3 = this.tileCache[0xC00 | address];
+	var tileBlock4 = this.tileCache[0xE00 | address];
+	var lineCopy = 0;
+	address = 0;
+	var addressFlipped = 56;
+	do {
+		lineCopy = (this.VRAM[0x1 | vramAddress] << 8) | this.VRAM[vramAddress];
+		tileBlock4[addressFlipped] = tileBlock2[address] = tileBlock3[addressFlipped | 7] = tileBlock1[address | 7] = ((lineCopy & 0x100) >> 7) | (lineCopy & 0x1);
+		tileBlock4[addressFlipped | 1] = tileBlock2[address | 1] = tileBlock3[addressFlipped | 6] = tileBlock1[address | 6] = ((lineCopy & 0x200) >> 8) | ((lineCopy & 0x2) >> 1);
+		tileBlock4[addressFlipped | 2] = tileBlock2[address | 2] = tileBlock3[addressFlipped | 5] = tileBlock1[address | 5] = ((lineCopy & 0x400) >> 9) | ((lineCopy & 0x4) >> 2);
+		tileBlock4[addressFlipped | 3] = tileBlock2[address | 3] = tileBlock3[addressFlipped | 4] = tileBlock1[address | 4] = ((lineCopy & 0x800) >> 10) | ((lineCopy & 0x8) >> 3);
+		tileBlock4[addressFlipped | 4] = tileBlock2[address | 4] = tileBlock3[addressFlipped | 3] = tileBlock1[address | 3] = ((lineCopy & 0x1000) >> 11) | ((lineCopy & 0x10) >> 4);
+		tileBlock4[addressFlipped | 5] = tileBlock2[address | 5] = tileBlock3[addressFlipped | 2] = tileBlock1[address | 2] = ((lineCopy & 0x2000) >> 12) | ((lineCopy & 0x20) >> 5);
+		tileBlock4[addressFlipped | 6] = tileBlock2[address | 6] = tileBlock3[addressFlipped | 1] = tileBlock1[address | 1] = ((lineCopy & 0x4000) >> 13) | ((lineCopy & 0x40) >> 6);
+		tileBlock4[addressFlipped | 7] = tileBlock2[address | 7] = tileBlock3[addressFlipped] = tileBlock1[address] = ((lineCopy & 0x8000) >> 14) | ((lineCopy & 0x80) >> 7);
+		address += 8;
+		addressFlipped -= 8;
+		vramAddress += 2;
+	} while (addressFlipped > -1);
+}
+//Generate only a single tile line for the GB tile cache mode (OAM accessible range):
+GameBoyCore.prototype.generateGBOAMTileLine = function (address) {
+	var lineCopy = (this.memory[0x1 | address] << 8) | this.memory[0x9FFE & address];
+	address &= 0x1FFE;
+	var tileBlock1 = this.tileCache[address >> 4];
+	var tileBlock2 = this.tileCache[0x200 | (address >> 4)];
+	var tileBlock3 = this.tileCache[0x400 | (address >> 4)];
+	var tileBlock4 = this.tileCache[0x600 | (address >> 4)];
+	address = (address & 0xE) << 2;
+	var addressFlipped = 0x38 - address;
+	tileBlock4[addressFlipped] = tileBlock2[address] = tileBlock3[addressFlipped | 7] = tileBlock1[address | 7] = ((lineCopy & 0x100) >> 7) | (lineCopy & 0x1);
+	tileBlock4[addressFlipped | 1] = tileBlock2[address | 1] = tileBlock3[addressFlipped | 6] = tileBlock1[address | 6] = ((lineCopy & 0x200) >> 8) | ((lineCopy & 0x2) >> 1);
+	tileBlock4[addressFlipped | 2] = tileBlock2[address | 2] = tileBlock3[addressFlipped | 5] = tileBlock1[address | 5] = ((lineCopy & 0x400) >> 9) | ((lineCopy & 0x4) >> 2);
+	tileBlock4[addressFlipped | 3] = tileBlock2[address | 3] = tileBlock3[addressFlipped | 4] = tileBlock1[address | 4] = ((lineCopy & 0x800) >> 10) | ((lineCopy & 0x8) >> 3);
+	tileBlock4[addressFlipped | 4] = tileBlock2[address | 4] = tileBlock3[addressFlipped | 3] = tileBlock1[address | 3] = ((lineCopy & 0x1000) >> 11) | ((lineCopy & 0x10) >> 4);
+	tileBlock4[addressFlipped | 5] = tileBlock2[address | 5] = tileBlock3[addressFlipped | 2] = tileBlock1[address | 2] = ((lineCopy & 0x2000) >> 12) | ((lineCopy & 0x20) >> 5);
+	tileBlock4[addressFlipped | 6] = tileBlock2[address | 6] = tileBlock3[addressFlipped | 1] = tileBlock1[address | 1] = ((lineCopy & 0x4000) >> 13) | ((lineCopy & 0x40) >> 6);
+	tileBlock4[addressFlipped | 7] = tileBlock2[address | 7] = tileBlock3[addressFlipped] = tileBlock1[address] = ((lineCopy & 0x8000) >> 14) | ((lineCopy & 0x80) >> 7);
+}
+GameBoyCore.prototype.graphicsJIT = function () {
+	if (this.LCDisOn) {
+		this.totalLinesPassed = 0;			//Mark frame for ensuring a JIT pass for the next framebuffer output.
+		this.graphicsJITScanlineGroup();
+	}
+}
+GameBoyCore.prototype.graphicsJITVBlank = function () {
+	//JIT the graphics to v-blank framing:
+	this.totalLinesPassed += this.queuedScanLines;
+	this.graphicsJITScanlineGroup();
+}
+GameBoyCore.prototype.graphicsJITScanlineGroup = function () {
+	//Normal rendering JIT, where we try to do groups of scanlines at once:
+	while (this.queuedScanLines > 0) {
+		this.renderScanLine(this.lastUnrenderedLine);
+		if (this.lastUnrenderedLine < 143) {
+			++this.lastUnrenderedLine;
+		}
+		else {
+			this.lastUnrenderedLine = 0;
+		}
+		--this.queuedScanLines;
+	}
+}
+GameBoyCore.prototype.incrementScanLineQueue = function () {
+	if (this.queuedScanLines < 144) {
+		++this.queuedScanLines;
 	}
 	else {
-		//Flipped Y:
-		var y = 0;
-		var yINC = 8;
+		this.currentX = 0;
+		this.midScanlineOffset = -1;
+		if (this.lastUnrenderedLine < 143) {
+			++this.lastUnrenderedLine;
+		}
+		else {
+			this.lastUnrenderedLine = 0;
+		}
 	}
-	var lineIndex = 0;	//Line line we're working on.
-	if ((map & 0x20) == 0) {
-		//Normal X:
-		do {
-			//Copy data from bank 0:
-			tileRawLine = (this.memory[address | 0x1] << 8) | this.memory[address];
-			//Each pixel is composed of two bits: MSB is in the second byte, while the LSB is in the first byte.
-			tileBlock[y | 7] = ((tileRawLine & 0x100) >> 7) | (tileRawLine & 0x1);
-			tileBlock[y | 6] = ((tileRawLine & 0x200) >> 8) | ((tileRawLine & 0x2) >> 1);
-			tileBlock[y | 5] = ((tileRawLine & 0x400) >> 9) | ((tileRawLine & 0x4) >> 2);
-			tileBlock[y | 4] = ((tileRawLine & 0x800) >> 10) | ((tileRawLine & 0x8) >> 3);
-			tileBlock[y | 3] = ((tileRawLine & 0x1000) >> 11) | ((tileRawLine & 0x10) >> 4);
-			tileBlock[y | 2] = ((tileRawLine & 0x2000) >> 12) | ((tileRawLine & 0x20) >> 5);
-			tileBlock[y | 1] = ((tileRawLine & 0x4000) >> 13) | ((tileRawLine & 0x40) >> 6);
-			tileBlock[y] = ((tileRawLine & 0x8000) >> 14) | ((tileRawLine & 0x80) >> 7);
-			y += yINC;
-			address += 2;
-		} while (++lineIndex < 8);
-	}
-	else {
-		//Flipped X:
-		do {
-			//Copy data from bank 0:
-			tileRawLine = (this.memory[address | 0x1] << 8) | this.memory[address];
-			//Each pixel is composed of two bits: MSB is in the second byte, while the LSB is in the first byte.
-			tileBlock[y] = ((tileRawLine & 0x100) >> 7) | (tileRawLine & 0x1);
-			tileBlock[y | 1] = ((tileRawLine & 0x200) >> 8) | ((tileRawLine & 0x2) >> 1);
-			tileBlock[y | 2] = ((tileRawLine & 0x400) >> 9) | ((tileRawLine & 0x4) >> 2);
-			tileBlock[y | 3] = ((tileRawLine & 0x800) >> 10) | ((tileRawLine & 0x8) >> 3);
-			tileBlock[y | 4] = ((tileRawLine & 0x1000) >> 11) | ((tileRawLine & 0x10) >> 4);
-			tileBlock[y | 5] = ((tileRawLine & 0x2000) >> 12) | ((tileRawLine & 0x20) >> 5);
-			tileBlock[y | 6] = ((tileRawLine & 0x4000) >> 13) | ((tileRawLine & 0x40) >> 6);
-			tileBlock[y | 7] = ((tileRawLine & 0x8000) >> 14) | ((tileRawLine & 0x80) >> 7);
-			y += yINC;
-			address += 2;
-		} while (++lineIndex < 8);
-	}
-	//Set flag for the tile in the cache to valid:
-	this.tileCacheValid[tile] = 1;
-	//Return the obtained tile to the rendering path:
-	return tileBlock;
+}
+GameBoyCore.prototype.midScanLineJIT = function () {
+	this.graphicsJIT();
+	this.renderMidScanLine();
 }
 //Check for the highest priority IRQ to fire:
 GameBoyCore.prototype.launchIRQ = function () {
@@ -7482,6 +7731,9 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 						}
 					}
 					break;
+				case 0xFF03:
+					this.memoryHighReader[0x03] = this.memoryReader[0xFF03] = this.memoryReadBAD;
+					break;
 				case 0xFF04:
 					//DIV
 					this.memoryHighReader[0x04] = this.memoryReader[0xFF04] = function (parentObj, address) {
@@ -7491,10 +7743,24 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 						
 					}
 					break;
+				case 0xFF05:
+				case 0xFF06:
+					this.memoryHighReader[index & 0xFF] = this.memoryHighReadNormal;
+					this.memoryReader[index] = this.memoryReadNormal;
+					break;
 				case 0xFF07:
 					this.memoryHighReader[0x07] = this.memoryReader[0xFF07] = function (parentObj, address) {
 						return 0xF8 | parentObj.memory[0xFF07];
 					}
+					break;
+				case 0xFF08:
+				case 0xFF09:
+				case 0xFF0A:
+				case 0xFF0B:
+				case 0xFF0C:
+				case 0xFF0D:
+				case 0xFF0E:
+					this.memoryHighReader[index & 0xFF] = this.memoryReader[index] = this.memoryReadBAD;
 					break;
 				case 0xFF0F:
 					//IF
@@ -7512,6 +7778,10 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 						return 0x3F | parentObj.memory[0xFF11];
 					}
 					break;
+				case 0xFF12:
+					this.memoryHighReader[0x12] = this.memoryHighReadNormal;
+					this.memoryReader[0xFF12] = this.memoryReadNormal;
+					break;
 				case 0xFF13:
 					this.memoryHighReader[0x13] = this.memoryReader[0xFF13] = this.memoryReadBAD;
 					break;
@@ -7520,10 +7790,18 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 						return 0xBF | parentObj.memory[0xFF14];
 					}
 					break;
+				case 0xFF15:
+					this.memoryHighReader[0x15] = this.memoryReadBAD;
+					this.memoryReader[0xFF15] = this.memoryReadBAD;
+					break;
 				case 0xFF16:
 					this.memoryHighReader[0x16] = this.memoryReader[0xFF16] = function (parentObj, address) {
 						return 0x3F | parentObj.memory[0xFF16];
 					}
+					break;
+				case 0xFF17:
+					this.memoryHighReader[0x17] = this.memoryHighReadNormal;
+					this.memoryReader[0xFF17] = this.memoryReadNormal;
 					break;
 				case 0xFF18:
 					this.memoryHighReader[0x18] = this.memoryReader[0xFF18] = this.memoryReadBAD;
@@ -7547,9 +7825,7 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 					}
 					break;
 				case 0xFF1D:
-					this.memoryHighReader[0x1D] = this.memoryReader[0xFF1D] = function (parentObj, address) {
-						return 0xFF;
-					}
+					this.memoryHighReader[0x1D] = this.memoryReader[0xFF1D] = this.memoryReadBAD;
 					break;
 				case 0xFF1E:
 					this.memoryHighReader[0x1E] = this.memoryReader[0xFF1E] = function (parentObj, address) {
@@ -7560,10 +7836,20 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 				case 0xFF20:
 					this.memoryHighReader[index & 0xFF] = this.memoryReader[index] = this.memoryReadBAD;
 					break;
+				case 0xFF21:
+				case 0xFF22:
+					this.memoryHighReader[index & 0xFF] = this.memoryHighReadNormal;
+					this.memoryReader[index] = this.memoryReadNormal;
+					break;
 				case 0xFF23:
 					this.memoryHighReader[0x23] = this.memoryReader[0xFF23] = function (parentObj, address) {
 						return 0xBF | parentObj.memory[0xFF23];
 					}
+					break;
+				case 0xFF24:
+				case 0xFF25:
+					this.memoryHighReader[index & 0xFF] = this.memoryHighReadNormal;
+					this.memoryReader[index] = this.memoryReadNormal;
 					break;
 				case 0xFF26:
 					this.memoryHighReader[0x26] = this.memoryReader[0xFF26] = function (parentObj, address) {
@@ -7599,11 +7885,15 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 				case 0xFF3E:
 				case 0xFF3F:
 					this.memoryReader[index] = function (parentObj, address) {
-						return (parentObj.channel3canPlay) ? parentObj.memory[0xFF00 | (parentObj.channel3Tracker >> 1)] : parentObj.memory[address];
+						return (parentObj.channel3canPlay) ? parentObj.memory[0xFF00 | (parentObj.channel3lastSampleLookup >> 1)] : parentObj.memory[address];
 					}
 					this.memoryHighReader[index & 0xFF] = function (parentObj, address) {
-						return (parentObj.channel3canPlay) ? parentObj.memory[0xFF00 | (parentObj.channel3Tracker >> 1)] : parentObj.memory[0xFF00 | address];
+						return (parentObj.channel3canPlay) ? parentObj.memory[0xFF00 | (parentObj.channel3lastSampleLookup >> 1)] : parentObj.memory[0xFF00 | address];
 					}
+					break;
+				case 0xFF40:
+					this.memoryHighReader[0x40] = this.memoryHighReadNormal;
+					this.memoryReader[0xFF40] = this.memoryReadNormal;
 					break;
 				case 0xFF41:
 					this.memoryHighReader[0x41] = this.memoryReader[0xFF41] = function (parentObj, address) {
@@ -7625,16 +7915,46 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 						return ((parentObj.LCDisOn) ? parentObj.memory[0xFF44] : 0);
 					}
 					break;
+				case 0xFF45:
+				case 0xFF46:
+				case 0xFF47:
+				case 0xFF48:
+				case 0xFF49:
+					this.memoryHighReader[index & 0xFF] = this.memoryHighReadNormal;
+					this.memoryReader[index] = this.memoryReadNormal;
+					break;
 				case 0xFF4A:
 					//WY
 					this.memoryHighReader[0x4A] = this.memoryReader[0xFF4A] = function (parentObj, address) {
 						return parentObj.windowY;
 					}
 					break;
+				case 0xFF4B:
+					this.memoryHighReader[0x4B] = this.memoryHighReadNormal;
+					this.memoryReader[0xFF4B] = this.memoryReadNormal;
+					break;
+				case 0xFF4C:
+					this.memoryHighReader[0x4C] = this.memoryReader[0xFF4C] = this.memoryReadBAD;
+					break;
+				case 0xFF4D:
+					this.memoryHighReader[0x4D] = this.memoryHighReadNormal;
+					this.memoryReader[0xFF4D] = this.memoryReadNormal;
+					break;
+				case 0xFF4E:
+					this.memoryHighReader[0x4E] = this.memoryReader[0xFF4E] = this.memoryReadBAD;
+					break;
 				case 0xFF4F:
 					this.memoryHighReader[0x4F] = this.memoryReader[0xFF4F] = function (parentObj, address) {
 						return parentObj.currVRAMBank;
 					}
+					break;
+				case 0xFF50:
+				case 0xFF51:
+				case 0xFF52:
+				case 0xFF53:
+				case 0xFF54:
+					this.memoryHighReader[index & 0xFF] = this.memoryHighReadNormal;
+					this.memoryReader[index] = this.memoryReadNormal;
 					break;
 				case 0xFF55:
 					if (this.cGBC) {
@@ -7665,6 +7985,32 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 						this.memoryHighReader[0x56] = this.memoryHighReadNormal;
 					}
 					break;
+				case 0xFF57:
+				case 0xFF58:
+				case 0xFF59:
+				case 0xFF5A:
+				case 0xFF5B:
+				case 0xFF5C:
+				case 0xFF5D:
+				case 0xFF5E:
+				case 0xFF5F:
+				case 0xFF60:
+				case 0xFF61:
+				case 0xFF62:
+				case 0xFF63:
+				case 0xFF64:
+				case 0xFF65:
+				case 0xFF66:
+				case 0xFF67:
+					this.memoryHighReader[index & 0xFF] = this.memoryReader[index] = this.memoryReadBAD;
+					break;
+				case 0xFF68:
+				case 0xFF69:
+				case 0xFF6A:
+				case 0xFF6B:
+					this.memoryHighReader[index & 0xFF] = this.memoryHighReadNormal;
+					this.memoryReader[index] = this.memoryReadNormal;
+					break;
 				case 0xFF6C:
 					if (this.cGBC) {
 						this.memoryHighReader[0x6C] = this.memoryReader[0xFF6C] = function (parentObj, address) {
@@ -7674,6 +8020,11 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 					else {
 						this.memoryHighReader[0x6C] = this.memoryReader[0xFF6C] = this.memoryReadBAD;
 					}
+					break;
+				case 0xFF6D:
+				case 0xFF6E:
+				case 0xFF6F:
+					this.memoryHighReader[index & 0xFF] = this.memoryReader[index] = this.memoryReadBAD;
 					break;
 				case 0xFF70:
 					if (this.cGBC) {
@@ -7686,6 +8037,21 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 						this.memoryHighReader[0x70] = this.memoryReader[0xFF70] = this.memoryReadBAD;
 					}
 					break;
+				case 0xFF71:
+					this.memoryHighReader[0x71] = this.memoryReader[0xFF71] = this.memoryReadBAD;
+					break;
+				case 0xFF72:
+				case 0xFF73:
+					this.memoryHighReader[index & 0xFF] = this.memoryReader[index] = this.memoryReadNormal;
+					break;
+				case 0xFF74:
+					if (this.cGBC) {
+						this.memoryHighReader[0x74] = this.memoryReader[0xFF74] = this.memoryReadNormal;
+					}
+					else {
+						this.memoryHighReader[0x74] = this.memoryReader[0xFF74] = this.memoryReadBAD;
+					}
+					break;
 				case 0xFF75:
 					this.memoryHighReader[0x75] = this.memoryReader[0xFF75] = function (parentObj, address) {
 						return 0x8F | parentObj.memory[0xFF75];
@@ -7696,6 +8062,16 @@ GameBoyCore.prototype.memoryReadJumpCompile = function () {
 					this.memoryHighReader[index & 0xFF] = this.memoryReader[index] = function (parentObj, address) {
 						return 0;
 					}
+					break;
+				case 0xFF78:
+				case 0xFF79:
+				case 0xFF7A:
+				case 0xFF7B:
+				case 0xFF7C:
+				case 0xFF7D:
+				case 0xFF7E:
+				case 0xFF7F:
+					this.memoryHighReader[index & 0xFF] = this.memoryReader[index] = this.memoryReadBAD;
 					break;
 				case 0xFFFF:
 					//IE
@@ -7828,29 +8204,20 @@ GameBoyCore.prototype.setCurrentMBC1ROMBank = function () {
 		case 0x40:
 		case 0x60:
 			//Bank calls for 0x00, 0x20, 0x40, and 0x60 are really for 0x01, 0x21, 0x41, and 0x61.
-			this.currentROMBank = this.ROMBank1offs << 14;
+			this.currentROMBank = (this.ROMBank1offs % this.ROMBankEdge) << 14;
 			break;
 		default:
-			this.currentROMBank = (this.ROMBank1offs - 1) << 14;
-	}
-	if (this.currentROMBank + 0x4000 >= this.ROM.length) {
-		this.currentROMBank = ((this.currentROMBank + 0x4000) % this.ROM.length) - 0x4000;
+			this.currentROMBank = ((this.ROMBank1offs % this.ROMBankEdge) - 1) << 14;
 	}
 }
 GameBoyCore.prototype.setCurrentMBC2AND3ROMBank = function () {
 	//Read the cartridge ROM data from RAM memory:
 	//Only map bank 0 to bank 1 here (MBC2 is like MBC1, but can only do 16 banks, so only the bank 0 quirk appears for MBC2):
-	this.currentROMBank = Math.max(this.ROMBank1offs - 1, 0) << 14;
-	if (this.currentROMBank + 0x4000 >= this.ROM.length) {
-		this.currentROMBank = ((this.currentROMBank + 0x4000) % this.ROM.length) - 0x4000;
-	}
+	this.currentROMBank = Math.max((this.ROMBank1offs % this.ROMBankEdge) - 1, 0) << 14;
 }
 GameBoyCore.prototype.setCurrentMBC5ROMBank = function () {
 	//Read the cartridge ROM data from RAM memory:
-	this.currentROMBank = (this.ROMBank1offs - 1) << 14;
-	if (this.currentROMBank + 0x4000 >= this.ROM.length) {
-		this.currentROMBank = ((this.currentROMBank + 0x4000) % this.ROM.length) - 0x4000;
-	}
+	this.currentROMBank = ((this.ROMBank1offs % this.ROMBankEdge) - 1) << 14;
 }
 //Memory Writing:
 GameBoyCore.prototype.memoryWrite = function (address, data) {
@@ -7980,7 +8347,7 @@ GameBoyCore.prototype.memoryWriteJumpCompile = function () {
 			}
 		}
 		else if (index <= 0xFEA0) {
-			this.memoryWriter[index] = (this.cGBC || (index & 3) != 0x1) ? this.memoryWriteGBCOAMRAM : this.memoryWriteGBOAMRAM;
+			this.memoryWriter[index] = this.memoryWriteOAMRAM;
 		}
 		else if (index < 0xFF00) {
 			if (this.cGBC) {											//Only GBC has access to this RAM.
@@ -8023,6 +8390,14 @@ GameBoyCore.prototype.MBC1WriteRAMBank = function (parentObj, address, data) {
 GameBoyCore.prototype.MBC1WriteType = function (parentObj, address, data) {
 	//MBC1 mode setting:
 	parentObj.MBC1Mode = ((data & 0x1) == 0x1);
+	if (parentObj.MBC1Mode) {
+		parentObj.ROMBank1offs &= 0x1F;
+		parentObj.setCurrentMBC1ROMBank();
+	}
+	else {
+		parentObj.currMBCRAMBank = 0;
+		parentObj.currMBCRAMBankPosition = -0xA000;
+	}
 }
 GameBoyCore.prototype.MBC2WriteROMBank = function (parentObj, address, data) {
 	//MBC2 ROM bank switching:
@@ -8144,52 +8519,12 @@ GameBoyCore.prototype.memoryWriteMBC3RAM = function (parentObj, address, data) {
 GameBoyCore.prototype.memoryWriteGBCRAM = function (parentObj, address, data) {
 	parentObj.GBCMemory[address + parentObj.gbcRamBankPosition] = data;
 }
-GameBoyCore.prototype.memoryWriteGBOAMRAM = function (parentObj, address, data) {
+GameBoyCore.prototype.memoryWriteOAMRAM = function (parentObj, address, data) {
 	if (parentObj.modeSTAT < 2) {		//OAM RAM cannot be written to in mode 2 & 3
-		var oldData = parentObj.memory[address];
-		if (oldData != data) {
-			parentObj.memory[address--] = data;
-			if (oldData > 0 && oldData < 168) {
-				//Remove the old position:
-				var length = parentObj.OAMAddresses[oldData].length;
-				while (length > 0) {
-					if (parentObj.OAMAddresses[oldData][--length] == address) {
-						parentObj.OAMAddresses[oldData].splice(length, 1);
-						break;
-					}
-				}
-			}
-			if (data > 0 && data < 168) {
-				//Make sure the stacking is correct if multiple sprites are at the same x-coord:
-				var length = parentObj.OAMAddresses[data].length;
-				while (length > 0) {
-					if (parentObj.OAMAddresses[data][--length] > address) {
-						parentObj.OAMAddresses[data].splice(length, 0, address);
-						return;
-					}
-				}
-				parentObj.OAMAddresses[data].push(address);
-			}
+		if (parentObj.memory[address] != data) {
+			parentObj.graphicsJIT();
+			parentObj.memory[address] = data;
 		}
-	}
-}
-GameBoyCore.prototype.memoryWriteGBOAMRAMUnsafe = function (parentObj, address, data) {
-	parentObj.memory[address--] = data;
-	if (data > 0 && data < 168) {
-		//Make sure the stacking is correct if multiple sprites are at the same x-coord:
-		var length = parentObj.OAMAddresses[data].length;
-		while (length > 0) {
-			if (parentObj.OAMAddresses[data][--length] > address) {
-				parentObj.OAMAddresses[data].splice(length, 0, address);
-				return;
-			}
-		}
-		parentObj.OAMAddresses[data].push(address);
-	}
-}
-GameBoyCore.prototype.memoryWriteGBCOAMRAM = function (parentObj, address, data) {
-	if (parentObj.modeSTAT < 2) {		//OAM RAM cannot be written to in mode 2 & 3
-		parentObj.memory[address] = data;
 	}
 }
 GameBoyCore.prototype.memoryWriteECHOGBCRAM = function (parentObj, address, data) {
@@ -8201,18 +8536,20 @@ GameBoyCore.prototype.memoryWriteECHONormal = function (parentObj, address, data
 GameBoyCore.prototype.VRAMGBDATAWrite = function (parentObj, address, data) {
 	if (parentObj.modeSTAT < 3) {	//VRAM cannot be written to during mode 3
 		if (parentObj.memory[address] != data) {
+			//JIT the graphics render queue:
+			parentObj.graphicsJIT();
 			parentObj.memory[address] = data;
-			data = (address & 0x1FF0) >> 4;
-			parentObj.tileCacheValid[data] = parentObj.tileCacheValid[0x200 | data] = parentObj.tileCacheValid[0x400 | data] = parentObj.tileCacheValid[0x600 | data] = 0;
+			parentObj.generateGBOAMTileLine(address);
 		}
 	}
 }
 GameBoyCore.prototype.VRAMGBDATAUpperWrite = function (parentObj, address, data) {
 	if (parentObj.modeSTAT < 3) {	//VRAM cannot be written to during mode 3
 		if (parentObj.memory[address] != data) {
+			//JIT the graphics render queue:
+			parentObj.graphicsJIT();
 			parentObj.memory[address] = data;
-			//Invalidate only one tile, since the OAM Attribute table cannot specify > 0xFF:
-			parentObj.tileCacheValid[(address & 0x1FF0) >> 4] = 0;
+			parentObj.generateGBTileLine(address);
 		}
 	}
 }
@@ -8220,28 +8557,41 @@ GameBoyCore.prototype.VRAMGBCDATAWrite = function (parentObj, address, data) {
 	if (parentObj.modeSTAT < 3) {	//VRAM cannot be written to during mode 3
 		if (parentObj.currVRAMBank == 0) {
 			if (parentObj.memory[address] != data) {
+				//JIT the graphics render queue:
+				parentObj.graphicsJIT();
 				parentObj.memory[address] = data;
-				data = (address & 0x1FF0) >> 4;
-				parentObj.tileCacheValid[data] = parentObj.tileCacheValid[0x400 | data] = parentObj.tileCacheValid[0x800 | data] = parentObj.tileCacheValid[0xC00 | data] = 0;
+				parentObj.generateGBCTileLineBank1(address);
 			}
 		}
 		else {
-			if (parentObj.VRAM[address & 0x1FFF] != data) {
-				parentObj.VRAM[address & 0x1FFF] = data;
-				data = (address & 0x1FF0) >> 4;
-				parentObj.tileCacheValid[0x200 | data] = parentObj.tileCacheValid[0x600 | data] = parentObj.tileCacheValid[0xA00 | data] = parentObj.tileCacheValid[0xE00 | data] = 0;
+			address &= 0x1FFF;
+			if (parentObj.VRAM[address] != data) {
+				//JIT the graphics render queue:
+				parentObj.graphicsJIT();
+				parentObj.VRAM[address] = data;
+				parentObj.generateGBCTileLineBank2(address);
 			}
 		}
 	}
 }
 GameBoyCore.prototype.VRAMGBCHRMAPWrite = function (parentObj, address, data) {
 	if (parentObj.modeSTAT < 3) {	//VRAM cannot be written to during mode 3
-		parentObj.BGCHRBank1[address & 0x7FF] = data;
+		address &= 0x7FF;
+		if (parentObj.BGCHRBank1[address] != data) {
+			//JIT the graphics render queue:
+			parentObj.graphicsJIT();
+			parentObj.BGCHRBank1[address] = data;
+		}
 	}
 }
 GameBoyCore.prototype.VRAMGBCCHRMAPWrite = function (parentObj, address, data) {
 	if (parentObj.modeSTAT < 3) {	//VRAM cannot be written to during mode 3
-		parentObj.BGCHRCurrentBank[address & 0x7FF] = data;
+		address &= 0x7FF;
+		if (parentObj.BGCHRCurrentBank[address] != data) {
+			//JIT the graphics render queue:
+			parentObj.graphicsJIT();
+			parentObj.BGCHRCurrentBank[address] = data;
+		}
 	}
 }
 GameBoyCore.prototype.DMAWrite = function (tilesToTransfer) {
@@ -8253,19 +8603,16 @@ GameBoyCore.prototype.DMAWrite = function (tilesToTransfer) {
 	var source = (this.memory[0xFF51] << 8) | this.memory[0xFF52];
 	//Destination address in the VRAM memory range:
 	var destination = (this.memory[0xFF53] << 8) | this.memory[0xFF54];
-	//Initialization:
-	var tileTarget = 0;
 	//Creating some references:
-	var tileCacheValid = this.tileCacheValid;
 	var memoryReader = this.memoryReader;
+	//JIT the graphics render queue:
+	this.graphicsJIT();
 	var memory = this.memory;
 	//Determining which bank we're working on so we can optimize:
 	if (this.currVRAMBank == 0) {
 		//DMA transfer for VRAM bank 0:
 		do {
 			if (destination < 0x1800) {
-				tileTarget = destination >> 4;
-				tileCacheValid[tileTarget] = tileCacheValid[0x400 | tileTarget] = tileCacheValid[0x800 | tileTarget] = tileCacheValid[0xC00 | tileTarget] = 0;
 				memory[0x8000 | destination] = memoryReader[source](this, source++);
 				memory[0x8001 | destination] = memoryReader[source](this, source++);
 				memory[0x8002 | destination] = memoryReader[source](this, source++);
@@ -8282,6 +8629,7 @@ GameBoyCore.prototype.DMAWrite = function (tilesToTransfer) {
 				memory[0x800D | destination] = memoryReader[source](this, source++);
 				memory[0x800E | destination] = memoryReader[source](this, source++);
 				memory[0x800F | destination] = memoryReader[source](this, source++);
+				this.generateGBCTileBank1(destination);
 				destination += 0x10;
 			}
 			else {
@@ -8313,24 +8661,24 @@ GameBoyCore.prototype.DMAWrite = function (tilesToTransfer) {
 		//DMA transfer for VRAM bank 1:
 		do {
 			if (destination < 0x1800) {
-				tileTarget = destination >> 4;
-				tileCacheValid[0x200 | tileTarget] = tileCacheValid[0x600 | tileTarget] = tileCacheValid[0xA00 | tileTarget] = tileCacheValid[0xE00 | tileTarget] = 0;
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
-				VRAM[destination++] = memoryReader[source](this, source++);
+				VRAM[destination] = memoryReader[source](this, source++);
+				VRAM[destination | 0x1] = memoryReader[source](this, source++);
+				VRAM[destination | 0x2] = memoryReader[source](this, source++);
+				VRAM[destination | 0x3] = memoryReader[source](this, source++);
+				VRAM[destination | 0x4] = memoryReader[source](this, source++);
+				VRAM[destination | 0x5] = memoryReader[source](this, source++);
+				VRAM[destination | 0x6] = memoryReader[source](this, source++);
+				VRAM[destination | 0x7] = memoryReader[source](this, source++);
+				VRAM[destination | 0x8] = memoryReader[source](this, source++);
+				VRAM[destination | 0x9] = memoryReader[source](this, source++);
+				VRAM[destination | 0xA] = memoryReader[source](this, source++);
+				VRAM[destination | 0xB] = memoryReader[source](this, source++);
+				VRAM[destination | 0xC] = memoryReader[source](this, source++);
+				VRAM[destination | 0xD] = memoryReader[source](this, source++);
+				VRAM[destination | 0xE] = memoryReader[source](this, source++);
+				VRAM[destination | 0xF] = memoryReader[source](this, source++);
+				this.generateGBCTileBank2(destination);
+				destination += 0x10;
 			}
 			else {
 				destination &= 0x7F0;
@@ -8374,6 +8722,11 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 			parentObj.memory[0xFF01] = data;
 		}
 	}
+	//SC (Serial Transfer Control):
+	this.memoryHighWriter[0x2] = this.memoryHighWriteNormal;
+	this.memoryWriter[0xFF02] = this.memoryWriteNormal;
+	//Unmapped I/O:
+	this.memoryHighWriter[0x3] = this.memoryWriter[0xFF03] = this.cartIgnoreWrite;
 	//DIV
 	this.memoryHighWriter[0x4] = this.memoryWriter[0xFF04] = function (parentObj, address, data) {
 		parentObj.DIVTicks &= 0xFF;	//Update DIV for realignment.
@@ -8393,32 +8746,36 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 		parentObj.TIMAEnabled = (data & 0x04) == 0x04;
 		parentObj.TACClocker = Math.pow(4, ((data & 0x3) != 0) ? (data & 0x3) : 4) << 2;	//TODO: Find a way to not make a conditional in here...
 	}
+	//Unmapped I/O:
+	this.memoryHighWriter[0x8] = this.memoryWriter[0xFF08] = this.cartIgnoreWrite;
+	this.memoryHighWriter[0x9] = this.memoryWriter[0xFF09] = this.cartIgnoreWrite;
+	this.memoryHighWriter[0xA] = this.memoryWriter[0xFF0A] = this.cartIgnoreWrite;
+	this.memoryHighWriter[0xB] = this.memoryWriter[0xFF0B] = this.cartIgnoreWrite;
+	this.memoryHighWriter[0xC] = this.memoryWriter[0xFF0C] = this.cartIgnoreWrite;
+	this.memoryHighWriter[0xD] = this.memoryWriter[0xFF0D] = this.cartIgnoreWrite;
+	this.memoryHighWriter[0xE] = this.memoryWriter[0xFF0E] = this.cartIgnoreWrite;
 	//IF (Interrupt Request)
 	this.memoryHighWriter[0xF] = this.memoryWriter[0xFF0F] = function (parentObj, address, data) {
 		parentObj.interruptsRequested = data;
 		parentObj.checkIRQMatching();
 	}
+	//NR10:
 	this.memoryHighWriter[0x10] = this.memoryWriter[0xFF10] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
 			if (parentObj.channel1decreaseSweep && (data & 0x08) == 0) {
-				if (parentObj.channel1numSweep != parentObj.channel1frequencySweepDivider) {
-					parentObj.channel1Fault |= 0x2;
+				if (parentObj.channel1Swept) {
+					parentObj.channel1SweepFault = true;
 				}
 			}
-			parentObj.channel1lastTimeSweep = parentObj.channel1timeSweep = (((data & 0x70) >> 4) * parentObj.channel1TimeSweepPreMultiplier) | 0;
-			parentObj.channel1frequencySweepDivider = parentObj.channel1numSweep = data & 0x07;
+			parentObj.channel1lastTimeSweep = (data & 0x70) >> 4;
+			parentObj.channel1frequencySweepDivider = data & 0x07;
 			parentObj.channel1decreaseSweep = ((data & 0x08) == 0x08);
-			//GB manual says that the audio won't play if this condition happens:
-			if (parentObj.channel1numSweep == 0 && parentObj.channel1lastTimeSweep > 0 && parentObj.channel1decreaseSweep) {
-				parentObj.channel1Fault |= 0x1;
-			}
-			else {
-				parentObj.channel1Fault &= 0x1;
-			}
 			parentObj.memory[0xFF10] = data;
+			parentObj.channel1EnableCheck();
 		}
 	}
+	//NR11:
 	this.memoryHighWriter[0x11] = this.memoryWriter[0xFF11] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled || !parentObj.cGBC) {
 			if (parentObj.soundMasterEnabled) {
@@ -8427,19 +8784,17 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 			else {
 				data &= 0x3F;
 			}
-			parentObj.channel1adjustedDuty = parentObj.dutyLookup[data >> 6];
-			parentObj.channel1totalLength = (0x40 - (data & 0x3F)) * parentObj.audioTotalLengthMultiplier;
-			parentObj.memory[0xFF11] = data & 0xC0;
+			parentObj.channel1CachedDuty = parentObj.dutyLookup[data >> 6];
+			parentObj.channel1totalLength = 0x40 - (data & 0x3F);
+			parentObj.memory[0xFF11] = data;
+			parentObj.channel1EnableCheck();
 		}
 	}
+	//NR12:
 	this.memoryHighWriter[0x12] = this.memoryWriter[0xFF12] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
-			if (data < 0x08) {
-				//Manual says this is a way to turn off the audio:
-				parentObj.channel1currentVolume = parentObj.channel1envelopeVolume = 0;
-			}
-			else if ((parentObj.channel1consecutive || parentObj.channel1totalLength > 0) && parentObj.channel1envelopeSweeps == 0) {
+			if (parentObj.channel1Enabled && parentObj.channel1envelopeSweeps == 0) {
 				//Zombie Volume PAPU Bug:
 				if (((parentObj.memory[0xFF12] ^ data) & 0x8) == 0x8) {
 					if ((parentObj.memory[0xFF12] & 0x8) == 0) {
@@ -8455,59 +8810,62 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 				else if ((parentObj.memory[0xFF12] & 0xF) == 0x8) {
 					parentObj.channel1envelopeVolume = (1 + parentObj.channel1envelopeVolume) & 0xF;
 				}
-				parentObj.channel1currentVolume = parentObj.channel1envelopeVolume / 0x1E;
+				parentObj.channel1OutputLevelCache();
 			}
 			parentObj.channel1envelopeType = ((data & 0x08) == 0x08);
 			parentObj.memory[0xFF12] = data;
+			parentObj.channel1VolumeEnableCheck();
 		}
 	}
+	//NR13:
 	this.memoryHighWriter[0x13] = this.memoryWriter[0xFF13] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
 			parentObj.channel1frequency = (parentObj.channel1frequency & 0x700) | data;
-			//Pre-calculate the frequency computation outside the waveform generator for speed:
-			parentObj.channel1adjustedFrequencyPrep = parentObj.preChewedAudioComputationMultiplier / (0x800 - parentObj.channel1frequency);
-			parentObj.memory[0xFF13] = data;
+			parentObj.channel1FrequencyTracker = (0x800 - parentObj.channel1frequency) << 2;
 		}
 	}
+	//NR14:
 	this.memoryHighWriter[0x14] = this.memoryWriter[0xFF14] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
 			parentObj.channel1consecutive = ((data & 0x40) == 0x0);
 			parentObj.channel1frequency = ((data & 0x7) << 8) | (parentObj.channel1frequency & 0xFF);
+			parentObj.channel1FrequencyTracker = (0x800 - parentObj.channel1frequency) << 2;
 			if (data > 0x7F) {
 				//Reload 0xFF10:
 				parentObj.channel1timeSweep = parentObj.channel1lastTimeSweep;
-				parentObj.channel1numSweep = parentObj.channel1frequencySweepDivider;
+				parentObj.channel1Swept = false;
 				//Reload 0xFF12:
 				var nr12 = parentObj.memory[0xFF12];
-				if (nr12 > 0x07) {
-					parentObj.channel1envelopeVolume = nr12 >> 4;
-					parentObj.channel1currentVolume = parentObj.channel1envelopeVolume / 0x1E;
-					parentObj.channel1envelopeSweeps = nr12 & 0x7;
-					parentObj.channel1volumeEnvTime = parentObj.channel1volumeEnvTimeLast = parentObj.channel1envelopeSweeps * parentObj.volumeEnvelopePreMultiplier;
-					if (parentObj.channel1totalLength <= 0) {
-						parentObj.channel1totalLength = 0x40 * parentObj.audioTotalLengthMultiplier;
-					}
+				parentObj.channel1envelopeVolume = nr12 >> 4;
+				parentObj.channel1OutputLevelCache();
+				parentObj.channel1envelopeSweepsLast = (nr12 & 0x7) - 1;
+				if (parentObj.channel1totalLength == 0) {
+					parentObj.channel1totalLength = 0x40;
+				}
+				if (parentObj.channel1lastTimeSweep > 0 || parentObj.channel1frequencySweepDivider > 0) {
+					parentObj.memory[0xFF26] |= 0x1;
+				}
+				else {
+					parentObj.memory[0xFF26] &= 0xFE;
 				}
 				if ((data & 0x40) == 0x40) {
 					parentObj.memory[0xFF26] |= 0x1;
 				}
 				parentObj.channel1ShadowFrequency = parentObj.channel1frequency;
 				//Reset frequency overflow check + frequency sweep type check:
-				parentObj.channel1Fault &= 0x2;
+				parentObj.channel1SweepFault = false;
+				//Supposed to run immediately:
+				parentObj.channel1AudioSweepPerformDummy();
 			}
-			if (parentObj.channel1numSweep == 0 && parentObj.channel1lastTimeSweep > 0 && parentObj.channel1decreaseSweep) {
-				parentObj.channel1Fault |= 0x1;
-			}
-			else {
-				parentObj.channel1Fault &= 0x1;
-			}
-			//Pre-calculate the frequency computation outside the waveform generator for speed:
-			parentObj.channel1adjustedFrequencyPrep = parentObj.preChewedAudioComputationMultiplier / (0x800 - parentObj.channel1frequency);
-			parentObj.memory[0xFF14] = data & 0x40;
+			parentObj.channel1EnableCheck();
+			parentObj.memory[0xFF14] = data;
 		}
 	}
+	//NR20 (Unused I/O):
+	this.memoryHighWriter[0x15] = this.memoryWriter[0xFF15] = this.cartIgnoreWrite;
+	//NR21:
 	this.memoryHighWriter[0x16] = this.memoryWriter[0xFF16] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled || !parentObj.cGBC) {
 			if (parentObj.soundMasterEnabled) {
@@ -8516,19 +8874,17 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 			else {
 				data &= 0x3F;
 			}
-			parentObj.channel2adjustedDuty = parentObj.dutyLookup[data >> 6];
-			parentObj.channel2totalLength = (0x40 - (data & 0x3F)) * parentObj.audioTotalLengthMultiplier;
-			parentObj.memory[0xFF16] = data & 0xC0;
+			parentObj.channel2CachedDuty = parentObj.dutyLookup[data >> 6];
+			parentObj.channel2totalLength = 0x40 - (data & 0x3F);
+			parentObj.memory[0xFF16] = data;
+			parentObj.channel2EnableCheck();
 		}
 	}
+	//NR22:
 	this.memoryHighWriter[0x17] = this.memoryWriter[0xFF17] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
-			if (data < 0x08) {
-				//Manual says this is a way to turn off the audio:
-				parentObj.channel2currentVolume = parentObj.channel2envelopeVolume = 0;
-			}
-			else if ((parentObj.channel2consecutive || parentObj.channel2totalLength > 0) && parentObj.channel2envelopeSweeps == 0) {
+			if (parentObj.channel2Enabled && parentObj.channel2envelopeSweeps == 0) {
 				//Zombie Volume PAPU Bug:
 				if (((parentObj.memory[0xFF17] ^ data) & 0x8) == 0x8) {
 					if ((parentObj.memory[0xFF17] & 0x8) == 0) {
@@ -8544,35 +8900,33 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 				else if ((parentObj.memory[0xFF17] & 0xF) == 0x8) {
 					parentObj.channel2envelopeVolume = (1 + parentObj.channel2envelopeVolume) & 0xF;
 				}
-				parentObj.channel2currentVolume = parentObj.channel2envelopeVolume / 0x1E;
+				parentObj.channel2OutputLevelCache();
 			}
 			parentObj.channel2envelopeType = ((data & 0x08) == 0x08);
 			parentObj.memory[0xFF17] = data;
+			parentObj.channel2VolumeEnableCheck();
 		}
 	}
+	//NR23:
 	this.memoryHighWriter[0x18] = this.memoryWriter[0xFF18] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
 			parentObj.channel2frequency = (parentObj.channel2frequency & 0x700) | data;
-			//Pre-calculate the frequency computation outside the waveform generator for speed:
-			parentObj.channel2adjustedFrequencyPrep = parentObj.preChewedAudioComputationMultiplier / (0x800 - parentObj.channel2frequency);
-			parentObj.memory[0xFF18] = data;
+			parentObj.channel2FrequencyTracker = (0x800 - parentObj.channel2frequency) << 2;
 		}
 	}
+	//NR24:
 	this.memoryHighWriter[0x19] = this.memoryWriter[0xFF19] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
 			if (data > 0x7F) {
 				//Reload 0xFF17:
 				var nr22 = parentObj.memory[0xFF17];
-				if (nr22 > 0x7) {
-					parentObj.channel2envelopeVolume = nr22 >> 4;
-					parentObj.channel2currentVolume = parentObj.channel2envelopeVolume / 0x1E;
-					parentObj.channel2envelopeSweeps = nr22 & 0x7;
-					parentObj.channel2volumeEnvTime = parentObj.channel2volumeEnvTimeLast = parentObj.channel2envelopeSweeps * parentObj.volumeEnvelopePreMultiplier;
-					if (parentObj.channel2totalLength <= 0) {
-						parentObj.channel2totalLength = 0x40 * parentObj.audioTotalLengthMultiplier;
-					}
+				parentObj.channel2envelopeVolume = nr22 >> 4;
+				parentObj.channel2OutputLevelCache();
+				parentObj.channel2envelopeSweepsLast = (nr22 & 0x7) - 1;
+				if (parentObj.channel2totalLength == 0) {
+					parentObj.channel2totalLength = 0x40;
 				}
 				if ((data & 0x40) == 0x40) {
 					parentObj.memory[0xFF26] |= 0x2;
@@ -8580,83 +8934,91 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 			}
 			parentObj.channel2consecutive = ((data & 0x40) == 0x0);
 			parentObj.channel2frequency = ((data & 0x7) << 8) | (parentObj.channel2frequency & 0xFF);
-			//Pre-calculate the frequency computation outside the waveform generator for speed:
-			parentObj.channel2adjustedFrequencyPrep = parentObj.preChewedAudioComputationMultiplier / (0x800 - parentObj.channel2frequency);
-			parentObj.memory[0xFF19] = data & 0x40;
+			parentObj.channel2FrequencyTracker = (0x800 - parentObj.channel2frequency) << 2;
+			parentObj.memory[0xFF19] = data;
+			parentObj.channel2EnableCheck();
 		}
 	}
+	//NR30:
 	this.memoryHighWriter[0x1A] = this.memoryWriter[0xFF1A] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
 			if (!parentObj.channel3canPlay && data >= 0x80) {
-				parentObj.channel3Tracker = 0;
+				parentObj.channel3lastSampleLookup = 0;
+				parentObj.channel3UpdateCache();
 			}
 			parentObj.channel3canPlay = (data > 0x7F);
 			if (parentObj.channel3canPlay && parentObj.memory[0xFF1A] > 0x7F && !parentObj.channel3consecutive) {
 				parentObj.memory[0xFF26] |= 0x4;
 			}
-			parentObj.memory[0xFF1A] = data & 0x80;
+			parentObj.memory[0xFF1A] = data;
+			//parentObj.channel3EnableCheck();
 		}
 	}
+	//NR31:
 	this.memoryHighWriter[0x1B] = this.memoryWriter[0xFF1B] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled || !parentObj.cGBC) {
 			if (parentObj.soundMasterEnabled) {
 				parentObj.audioJIT();
 			}
-			parentObj.channel3totalLength = (0x100 - data) * parentObj.audioTotalLengthMultiplier;
-			parentObj.memory[0xFF1B] = data;
+			parentObj.channel3totalLength = 0x100 - data;
+			parentObj.channel3EnableCheck();
 		}
 	}
+	//NR32:
 	this.memoryHighWriter[0x1C] = this.memoryWriter[0xFF1C] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
-			parentObj.memory[0xFF1C] = data & 0x60;
-			parentObj.channel3patternType = parentObj.memory[0xFF1C] - 0x20;
+			data &= 0x60;
+			parentObj.memory[0xFF1C] = data;
+			parentObj.channel3patternType = (data == 0) ? 4 : ((data >> 5) - 1);
 		}
 	}
+	//NR33:
 	this.memoryHighWriter[0x1D] = this.memoryWriter[0xFF1D] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
 			parentObj.channel3frequency = (parentObj.channel3frequency & 0x700) | data;
-			parentObj.channel3adjustedFrequencyPrep = parentObj.preChewedWAVEAudioComputationMultiplier / (0x800 - parentObj.channel3frequency);
-			parentObj.memory[0xFF1D] = data;
+			parentObj.channel3FrequencyPeriod = (0x800 - parentObj.channel3frequency) << 1;
 		}
 	}
+	//NR34:
 	this.memoryHighWriter[0x1E] = this.memoryWriter[0xFF1E] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
 			if (data > 0x7F) {
-				if (parentObj.channel3totalLength <= 0) {
-					parentObj.channel3totalLength = 0x100 * parentObj.audioTotalLengthMultiplier;
+				if (parentObj.channel3totalLength == 0) {
+					parentObj.channel3totalLength = 0x100;
 				}
-				parentObj.channel3Tracker = 0;
+				parentObj.channel3lastSampleLookup = 0;
 				if ((data & 0x40) == 0x40) {
 					parentObj.memory[0xFF26] |= 0x4;
 				}
 			}
 			parentObj.channel3consecutive = ((data & 0x40) == 0x0);
 			parentObj.channel3frequency = ((data & 0x7) << 8) | (parentObj.channel3frequency & 0xFF);
-			parentObj.channel3adjustedFrequencyPrep = parentObj.preChewedWAVEAudioComputationMultiplier / (0x800 - parentObj.channel3frequency);
-			parentObj.memory[0xFF1E] = data & 0x40;
+			parentObj.channel3FrequencyPeriod = (0x800 - parentObj.channel3frequency) << 1;
+			parentObj.memory[0xFF1E] = data;
+			parentObj.channel3EnableCheck();
 		}
 	}
+	//NR40 (Unused I/O):
+	this.memoryHighWriter[0x1F] = this.memoryWriter[0xFF1F] = this.cartIgnoreWrite;
+	//NR41:
 	this.memoryHighWriter[0x20] = this.memoryWriter[0xFF20] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled || !parentObj.cGBC) {
 			if (parentObj.soundMasterEnabled) {
 				parentObj.audioJIT();
 			}
-			parentObj.channel4totalLength = (0x40 - (data & 0x3F)) * parentObj.audioTotalLengthMultiplier;
-			parentObj.memory[0xFF20] = data | 0xC0;
+			parentObj.channel4totalLength = 0x40 - (data & 0x3F);
+			parentObj.channel4EnableCheck();
 		}
 	}
+	//NR42:
 	this.memoryHighWriter[0x21] = this.memoryWriter[0xFF21] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
-			if (data < 0x08) {
-				//Manual says this is a way to turn off the audio:
-				parentObj.channel4currentVolume = parentObj.channel4envelopeVolume = 0;
-			}
-			/*else if ((parentObj.channel4consecutive || parentObj.channel4totalLength > 0) && parentObj.channel4envelopeSweeps == 0) {
+			if (parentObj.channel4Enabled && parentObj.channel4envelopeSweeps == 0) {
 				//Zombie Volume PAPU Bug:
 				if (((parentObj.memory[0xFF21] ^ data) & 0x8) == 0x8) {
 					if ((parentObj.memory[0xFF21] & 0x8) == 0) {
@@ -8673,26 +9035,31 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 					parentObj.channel4envelopeVolume = (1 + parentObj.channel4envelopeVolume) & 0xF;
 				}
 				parentObj.channel4currentVolume = parentObj.channel4envelopeVolume << parentObj.channel4VolumeShifter;
-			}*/
+			}
 			parentObj.channel4envelopeType = ((data & 0x08) == 0x08);
 			parentObj.memory[0xFF21] = data;
+			parentObj.channel4UpdateCache();
+			parentObj.channel4VolumeEnableCheck();
 		}
 	}
+	//NR43:
 	this.memoryHighWriter[0x22] = this.memoryWriter[0xFF22] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
-			parentObj.channel4adjustedFrequencyPrep = (data < 0x80 && (data & 0xF0) != 0x70) ? (parentObj.whiteNoiseFrequencyPreMultiplier / Math.max(data & 0x7, 0.5) / Math.pow(2, (data >> 4) + 1)) : 0;
+			parentObj.channel4FrequencyPeriod = Math.max((data & 0x7) << 4, 8) << (data >> 4);
 			var bitWidth = (data & 0x8);
-			if ((bitWidth == 0x8 && parentObj.noiseTableLength == 0x8000) || (bitWidth == 0 && parentObj.noiseTableLength == 0x80)) {
+			if ((bitWidth == 0x8 && parentObj.channel4BitRange == 0x7FFF) || (bitWidth == 0 && parentObj.channel4BitRange == 0x7F)) {
 				parentObj.channel4lastSampleLookup = 0;
-				parentObj.noiseTableLength = (bitWidth == 0x8) ? 0x80 : 0x8000;
+				parentObj.channel4BitRange = (bitWidth == 0x8) ? 0x7F : 0x7FFF;
 				parentObj.channel4VolumeShifter = (bitWidth == 0x8) ? 7 : 15;
 				parentObj.channel4currentVolume = parentObj.channel4envelopeVolume << parentObj.channel4VolumeShifter;
 				parentObj.noiseSampleTable = (bitWidth == 0x8) ? parentObj.LSFR7Table : parentObj.LSFR15Table;
 			}
 			parentObj.memory[0xFF22] = data;
+			parentObj.channel4UpdateCache();
 		}
 	}
+	//NR44:
 	this.memoryHighWriter[0x23] = this.memoryWriter[0xFF23] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled) {
 			parentObj.audioJIT();
@@ -8700,53 +9067,57 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 			parentObj.channel4consecutive = ((data & 0x40) == 0x0);
 			if (data > 0x7F) {
 				var nr42 = parentObj.memory[0xFF21];
-				if (nr42 > 0x7) {
-					parentObj.channel4envelopeVolume = nr42 >> 4;
-					parentObj.channel4currentVolume = parentObj.channel4envelopeVolume << parentObj.channel4VolumeShifter;
-					parentObj.channel4envelopeSweeps = nr42 & 0x7;
-					parentObj.channel4volumeEnvTime = parentObj.channel4volumeEnvTimeLast = parentObj.channel4envelopeSweeps * parentObj.volumeEnvelopePreMultiplier;
-					if (parentObj.channel4totalLength <= 0) {
-						parentObj.channel4totalLength = 0x40 * parentObj.audioTotalLengthMultiplier;
-					}
+				parentObj.channel4envelopeVolume = nr42 >> 4;
+				parentObj.channel4currentVolume = parentObj.channel4envelopeVolume << parentObj.channel4VolumeShifter;
+				parentObj.channel4envelopeSweepsLast = (nr42 & 0x7) - 1;
+				if (parentObj.channel4totalLength == 0) {
+					parentObj.channel4totalLength = 0x40;
 				}
 				if ((data & 0x40) == 0x40) {
 					parentObj.memory[0xFF26] |= 0x8;
 				}
 			}
+			parentObj.channel4EnableCheck();
 		}
 	}
+	//NR50:
 	this.memoryHighWriter[0x24] = this.memoryWriter[0xFF24] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled && parentObj.memory[0xFF24] != data) {
 			parentObj.audioJIT();
 			parentObj.memory[0xFF24] = data;
-			parentObj.VinLeftChannelMasterVolume = (((data >> 4) & 0x07) + 1) / 8;
-			parentObj.VinRightChannelMasterVolume = ((data & 0x07) + 1) / 8;
+			parentObj.VinLeftChannelMasterVolume = ((data >> 4) & 0x07) + 1;
+			parentObj.VinRightChannelMasterVolume = (data & 0x07) + 1;
+			parentObj.mixerOutputLevelCache();
 		}
 	}
+	//NR51:
 	this.memoryHighWriter[0x25] = this.memoryWriter[0xFF25] = function (parentObj, address, data) {
 		if (parentObj.soundMasterEnabled && parentObj.memory[0xFF25] != data) {
 			parentObj.audioJIT();
 			parentObj.memory[0xFF25] = data;
-			parentObj.rightChannel0 = ((data & 0x01) == 0x01);
-			parentObj.rightChannel1 = ((data & 0x02) == 0x02);
-			parentObj.rightChannel2 = ((data & 0x04) == 0x04);
-			parentObj.rightChannel3 = ((data & 0x08) == 0x08);
-			parentObj.leftChannel0 = ((data & 0x10) == 0x10);
-			parentObj.leftChannel1 = ((data & 0x20) == 0x20);
-			parentObj.leftChannel2 = ((data & 0x40) == 0x40);
-			parentObj.leftChannel3 = (data > 0x7F);
+			parentObj.rightChannel1 = ((data & 0x01) == 0x01);
+			parentObj.rightChannel2 = ((data & 0x02) == 0x02);
+			parentObj.rightChannel3 = ((data & 0x04) == 0x04);
+			parentObj.rightChannel4 = ((data & 0x08) == 0x08);
+			parentObj.leftChannel1 = ((data & 0x10) == 0x10);
+			parentObj.leftChannel2 = ((data & 0x20) == 0x20);
+			parentObj.leftChannel3 = ((data & 0x40) == 0x40);
+			parentObj.leftChannel4 = (data > 0x7F);
+			parentObj.channel1OutputLevelCache();
+			parentObj.channel2OutputLevelCache();
+			parentObj.channel3OutputLevelCache();
+			parentObj.channel4OutputLevelCache();
 		}
 	}
+	//NR52:
 	this.memoryHighWriter[0x26] = this.memoryWriter[0xFF26] = function (parentObj, address, data) {
 		parentObj.audioJIT();
-		var soundEnabled = (data & 0x80);
-		parentObj.memory[0xFF26] = soundEnabled | (parentObj.memory[0xFF26] & 0xF);
-		if (!parentObj.soundMasterEnabled && (soundEnabled == 0x80)) {
-			parentObj.memory[0xFF26] = 0;
+		if (!parentObj.soundMasterEnabled && data > 0x7F) {
+			parentObj.memory[0xFF26] = 0x80;
 			parentObj.soundMasterEnabled = true;
 			parentObj.initializeAudioStartState();
 		}
-		else if (parentObj.soundMasterEnabled && (soundEnabled == 0)) {
+		else if (parentObj.soundMasterEnabled && data < 0x80) {
 			parentObj.memory[0xFF26] = 0;
 			parentObj.soundMasterEnabled = false;
 			//GBDev wiki says the registers are written with zeros on power off:
@@ -8767,208 +9138,64 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 	this.memoryHighWriter[0x2F] = this.memoryWriter[0xFF2F] = this.cartIgnoreWrite;
 	//WAVE PCM RAM:
 	this.memoryHighWriter[0x30] = this.memoryWriter[0xFF30] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF30] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF30] = data;
-			parentObj.channel3PCM[0x00] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x20] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x40] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x01] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x21] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x41] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0, data);
 	}
 	this.memoryHighWriter[0x31] = this.memoryWriter[0xFF31] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF31] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF31] = data;
-			parentObj.channel3PCM[0x02] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x22] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x42] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x03] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x23] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x43] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0x1, data);
 	}
 	this.memoryHighWriter[0x32] = this.memoryWriter[0xFF32] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF32] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF32] = data;
-			parentObj.channel3PCM[0x04] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x24] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x44] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x05] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x25] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x45] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0x2, data);
 	}
 	this.memoryHighWriter[0x33] = this.memoryWriter[0xFF33] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF33] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF33] = data;
-			parentObj.channel3PCM[0x06] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x26] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x46] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x07] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x27] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x47] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0x3, data);
 	}
 	this.memoryHighWriter[0x34] = this.memoryWriter[0xFF34] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF34] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF34] = data;
-			parentObj.channel3PCM[0x08] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x28] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x48] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x09] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x29] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x49] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0x4, data);
 	}
 	this.memoryHighWriter[0x35] = this.memoryWriter[0xFF35] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF35] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF35] = data;
-			parentObj.channel3PCM[0x0A] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x2A] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x4A] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x0B] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x2B] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x4B] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0x5, data);
 	}
 	this.memoryHighWriter[0x36] = this.memoryWriter[0xFF36] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF36] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF36] = data;
-			parentObj.channel3PCM[0x0C] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x2C] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x4C] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x0D] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x2D] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x4D] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0x6, data);
 	}
 	this.memoryHighWriter[0x37] = this.memoryWriter[0xFF37] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF37] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF37] = data;
-			parentObj.channel3PCM[0x0E] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x2E] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x4E] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x0F] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x2F] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x4F] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0x7, data);
 	}
 	this.memoryHighWriter[0x38] = this.memoryWriter[0xFF38] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF38] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF38] = data;
-			parentObj.channel3PCM[0x10] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x30] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x50] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x11] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x31] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x51] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0x8, data);
 	}
 	this.memoryHighWriter[0x39] = this.memoryWriter[0xFF39] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF39] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF39] = data;
-			parentObj.channel3PCM[0x12] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x32] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x52] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x13] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x33] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x53] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0x9, data);
 	}
 	this.memoryHighWriter[0x3A] = this.memoryWriter[0xFF3A] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF3A] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF3A] = data;
-			parentObj.channel3PCM[0x14] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x34] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x54] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x15] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x35] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x55] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0xA, data);
 	}
 	this.memoryHighWriter[0x3B] = this.memoryWriter[0xFF3B] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF3B] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF3B] = data;
-			parentObj.channel3PCM[0x16] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x36] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x56] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x17] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x37] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x57] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0xB, data);
 	}
 	this.memoryHighWriter[0x3C] = this.memoryWriter[0xFF3C] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF3C] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF3C] = data;
-			parentObj.channel3PCM[0x18] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x38] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x58] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x19] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x39] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x59] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0xC, data);
 	}
 	this.memoryHighWriter[0x3D] = this.memoryWriter[0xFF3D] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF3D] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF3D] = data;
-			parentObj.channel3PCM[0x1A] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x3A] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x5A] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x1B] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x3B] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x5B] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0xD, data);
 	}
 	this.memoryHighWriter[0x3E] = this.memoryWriter[0xFF3E] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF3E] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF3E] = data;
-			parentObj.channel3PCM[0x1C] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x3C] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x5C] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x1D] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x3D] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x5D] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0xE, data);
 	}
 	this.memoryHighWriter[0x3F] = this.memoryWriter[0xFF3F] = function (parentObj, address, data) {
-		if (parentObj.memory[0xFF3F] != data) {
-			parentObj.audioJIT();
-			parentObj.memory[0xFF3F] = data;
-			parentObj.channel3PCM[0x1E] = (data >> 4) / 0x1E;
-			parentObj.channel3PCM[0x3E] = (data >> 5) / 0x1E;
-			parentObj.channel3PCM[0x5E] = (data >> 6) / 0x1E;
-			parentObj.channel3PCM[0x1F] = (data & 0xF) / 0x1E;
-			parentObj.channel3PCM[0x3F] = (data & 0xE) / 0x3C;
-			parentObj.channel3PCM[0x5F] = (data & 0xC) / 0x78;
-		}
+		parentObj.channel3WriteRAM(0xF, data);
 	}
 	//SCY
 	this.memoryHighWriter[0x42] = this.memoryWriter[0xFF42] = function (parentObj, address, data) {
 		if (parentObj.backgroundY != data) {
-			parentObj.renderMidScanLine();
+			parentObj.midScanLineJIT();
 			parentObj.backgroundY = data;
 		}
 	}
 	//SCX
 	this.memoryHighWriter[0x43] = this.memoryWriter[0xFF43] = function (parentObj, address, data) {
 		if (parentObj.backgroundX != data) {
-			parentObj.renderMidScanLine();
+			parentObj.midScanLineJIT();
 			parentObj.backgroundX = data;
 		}
 	}
@@ -8977,12 +9204,9 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 		//Read Only:
 		if (parentObj.LCDisOn) {
 			//Gambatte says to do this:
-			if (parentObj.drewBlank == 0 && (parentObj.actualScanLine > 0 || parentObj.STATTracker == 2)) {
-				//Blit out the partial frame:
-				parentObj.drawToCanvas();
-			}
 			parentObj.modeSTAT = 2;
-			parentObj.LCDTicks = parentObj.STATTracker = parentObj.actualScanLine = parentObj.memory[0xFF44] = 0;
+			parentObj.midScanlineOffset = -1;
+			parentObj.totalLinesPassed = parentObj.currentX = parentObj.queuedScanLines = parentObj.lastUnrenderedLine = parentObj.LCDTicks = parentObj.STATTracker = parentObj.actualScanLine = parentObj.memory[0xFF44] = 0;
 		}
 	}
 	//LYC
@@ -8997,14 +9221,14 @@ GameBoyCore.prototype.registerWriteJumpCompile = function () {
 	//WY
 	this.memoryHighWriter[0x4A] = this.memoryWriter[0xFF4A] = function (parentObj, address, data) {
 		if (parentObj.windowY != data) {
-			parentObj.renderMidScanLine();
+			parentObj.midScanLineJIT();
 			parentObj.windowY = data;
 		}
 	}
 	//WX
 	this.memoryHighWriter[0x4B] = this.memoryWriter[0xFF4B] = function (parentObj, address, data) {
 		if (parentObj.memory[0xFF4B] != data) {
-			parentObj.renderMidScanLine();
+			parentObj.midScanLineJIT();
 			parentObj.memory[0xFF4B] = data;
 			parentObj.windowX = data - 7;
 		}
@@ -9047,34 +9271,36 @@ GameBoyCore.prototype.recompileModelSpecificIOWriteHandling = function () {
 		}
 		this.memoryHighWriter[0x40] = this.memoryWriter[0xFF40] = function (parentObj, address, data) {
 			if (parentObj.memory[0xFF40] != data) {
-				parentObj.renderMidScanLine();
-			}
-			var temp_var = (data > 0x7F);
-			if (temp_var != parentObj.LCDisOn) {
-				//When the display mode changes...
-				parentObj.LCDisOn = temp_var;
-				parentObj.memory[0xFF41] &= 0x78;
-				parentObj.STATTracker = parentObj.LCDTicks = parentObj.actualScanLine = parentObj.memory[0xFF44] = 0;
-				if (parentObj.LCDisOn) {
-					parentObj.modeSTAT = 2;
-					parentObj.matchLYC();	//Get the compare of the first scan line.
-					parentObj.LCDCONTROL = parentObj.LINECONTROL;
+				parentObj.midScanLineJIT();
+				var temp_var = (data > 0x7F);
+				if (temp_var != parentObj.LCDisOn) {
+					//When the display mode changes...
+					parentObj.LCDisOn = temp_var;
+					parentObj.memory[0xFF41] &= 0x78;
+					parentObj.midScanlineOffset = -1;
+					parentObj.totalLinesPassed = parentObj.currentX = parentObj.queuedScanLines = parentObj.lastUnrenderedLine = parentObj.STATTracker = parentObj.LCDTicks = parentObj.actualScanLine = parentObj.memory[0xFF44] = 0;
+					if (parentObj.LCDisOn) {
+						parentObj.modeSTAT = 2;
+						parentObj.matchLYC();	//Get the compare of the first scan line.
+						parentObj.LCDCONTROL = parentObj.LINECONTROL;
+					}
+					else {
+						parentObj.modeSTAT = 0;
+						parentObj.LCDCONTROL = parentObj.DISPLAYOFFCONTROL;
+						parentObj.DisplayShowOff();
+					}
+					parentObj.interruptsRequested &= 0xFD;
 				}
-				else {
-					parentObj.modeSTAT = 0;
-					parentObj.LCDCONTROL = parentObj.DISPLAYOFFCONTROL;
-					parentObj.DisplayShowOff();
-				}
-				parentObj.interruptsRequested &= 0xFD;
+				parentObj.gfxWindowCHRBankPosition = ((data & 0x40) == 0x40) ? 0x400 : 0;
+				parentObj.gfxWindowDisplay = ((data & 0x20) == 0x20);
+				parentObj.gfxBackgroundBankOffset = ((data & 0x10) == 0x10) ? 0 : 0x80;
+				parentObj.gfxBackgroundCHRBankPosition = ((data & 0x08) == 0x08) ? 0x400 : 0;
+				parentObj.gfxSpriteNormalHeight = ((data & 0x04) == 0);
+				parentObj.gfxSpriteShow = ((data & 0x02) == 0x02);
+				parentObj.BGPriorityEnabled = ((data & 0x01) == 0x01);
+				parentObj.priorityFlaggingPathRebuild();	//Special case the priority flagging as an optimization.
+				parentObj.memory[0xFF40] = data;
 			}
-			parentObj.gfxWindowCHRBankPosition = ((data & 0x40) == 0x40) ? 0x400 : 0;
-			parentObj.gfxWindowDisplay = ((data & 0x20) == 0x20);
-			parentObj.gfxBackgroundBankOffset = ((data & 0x10) == 0x10) ? 0 : 0x80;
-			parentObj.gfxBackgroundCHRBankPosition = ((data & 0x08) == 0x08) ? 0x400 : 0;
-			parentObj.gfxSpriteNormalHeight = ((data & 0x04) == 0);
-			parentObj.gfxSpriteShow = ((data & 0x02) == 0x02);
-			parentObj.BGPriorityEnabled = ((data & 0x01) == 0x01) ? 0x1000000 : 0;
-			parentObj.memory[0xFF40] = data;
 		}
 		this.memoryHighWriter[0x41] = this.memoryWriter[0xFF41] = function (parentObj, address, data) {
 			parentObj.LYCMatchTriggerSTAT = ((data & 0x40) == 0x40);
@@ -9090,9 +9316,26 @@ GameBoyCore.prototype.recompileModelSpecificIOWriteHandling = function () {
 				address = 0xFE00;
 				var stat = parentObj.modeSTAT;
 				parentObj.modeSTAT = 0;
+				var newData = 0;
 				do {
-					parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
-				} while (address < 0xFEA0);
+					newData = parentObj.memoryReader[data](parentObj, data++);
+					if (newData != parentObj.memory[address]) {
+						//JIT the graphics render queue:
+						parentObj.modeSTAT = stat;
+						parentObj.graphicsJIT();
+						parentObj.modeSTAT = 0;
+						parentObj.memory[address++] = newData;
+						break;
+					}
+				} while (++address < 0xFEA0);
+				if (address < 0xFEA0) {
+					do {
+						parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
+						parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
+						parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
+						parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
+					} while (address < 0xFEA0);
+				}
 				parentObj.modeSTAT = stat;
 			}
 		}
@@ -9214,34 +9457,35 @@ GameBoyCore.prototype.recompileModelSpecificIOWriteHandling = function () {
 		}
 		this.memoryHighWriter[0x40] = this.memoryWriter[0xFF40] = function (parentObj, address, data) {
 			if (parentObj.memory[0xFF40] != data) {
-				parentObj.renderMidScanLine();
-			}
-			var temp_var = (data > 0x7F);
-			if (temp_var != parentObj.LCDisOn) {
-				//When the display mode changes...
-				parentObj.LCDisOn = temp_var;
-				parentObj.memory[0xFF41] &= 0x78;
-				parentObj.STATTracker = parentObj.LCDTicks = parentObj.actualScanLine = parentObj.memory[0xFF44] = 0;
-				if (parentObj.LCDisOn) {
-					parentObj.modeSTAT = 2;
-					parentObj.matchLYC();	//Get the compare of the first scan line.
-					parentObj.LCDCONTROL = parentObj.LINECONTROL;
+				parentObj.midScanLineJIT();
+				var temp_var = (data > 0x7F);
+				if (temp_var != parentObj.LCDisOn) {
+					//When the display mode changes...
+					parentObj.LCDisOn = temp_var;
+					parentObj.memory[0xFF41] &= 0x78;
+					parentObj.midScanlineOffset = -1;
+					parentObj.totalLinesPassed = parentObj.currentX = parentObj.queuedScanLines = parentObj.lastUnrenderedLine = parentObj.STATTracker = parentObj.LCDTicks = parentObj.actualScanLine = parentObj.memory[0xFF44] = 0;
+					if (parentObj.LCDisOn) {
+						parentObj.modeSTAT = 2;
+						parentObj.matchLYC();	//Get the compare of the first scan line.
+						parentObj.LCDCONTROL = parentObj.LINECONTROL;
+					}
+					else {
+						parentObj.modeSTAT = 0;
+						parentObj.LCDCONTROL = parentObj.DISPLAYOFFCONTROL;
+						parentObj.DisplayShowOff();
+					}
+					parentObj.interruptsRequested &= 0xFD;
 				}
-				else {
-					parentObj.modeSTAT = 0;
-					parentObj.LCDCONTROL = parentObj.DISPLAYOFFCONTROL;
-					parentObj.DisplayShowOff();
-				}
-				parentObj.interruptsRequested &= 0xFD;
+				parentObj.gfxWindowCHRBankPosition = ((data & 0x40) == 0x40) ? 0x400 : 0;
+				parentObj.gfxWindowDisplay = (data & 0x20) == 0x20;
+				parentObj.gfxBackgroundBankOffset = ((data & 0x10) == 0x10) ? 0 : 0x80;
+				parentObj.gfxBackgroundCHRBankPosition = ((data & 0x08) == 0x08) ? 0x400 : 0;
+				parentObj.gfxSpriteNormalHeight = ((data & 0x04) == 0);
+				parentObj.gfxSpriteShow = (data & 0x02) == 0x02;
+				parentObj.bgEnabled = ((data & 0x01) == 0x01);
+				parentObj.memory[0xFF40] = data;
 			}
-			parentObj.gfxWindowCHRBankPosition = ((data & 0x40) == 0x40) ? 0x400 : 0;
-			parentObj.gfxWindowDisplay = (data & 0x20) == 0x20;
-			parentObj.gfxBackgroundBankOffset = ((data & 0x10) == 0x10) ? 0 : 0x80;
-			parentObj.gfxBackgroundCHRBankPosition = ((data & 0x08) == 0x08) ? 0x400 : 0;
-			parentObj.gfxSpriteNormalHeight = ((data & 0x04) == 0);
-			parentObj.gfxSpriteShow = (data & 0x02) == 0x02;
-			parentObj.bgEnabled = ((data & 0x01) == 0x01);
-			parentObj.memory[0xFF40] = data;
 		}
 		this.memoryHighWriter[0x41] = this.memoryWriter[0xFF41] = function (parentObj, address, data) {
 			parentObj.LYCMatchTriggerSTAT = ((data & 0x40) == 0x40);
@@ -9261,33 +9505,46 @@ GameBoyCore.prototype.recompileModelSpecificIOWriteHandling = function () {
 				address = 0xFE00;
 				var stat = parentObj.modeSTAT;
 				parentObj.modeSTAT = 0;
-				parentObj.resetOAMXCache();
+				var newData = 0;
 				do {
-					parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
-					parentObj.memoryWriteGBOAMRAMUnsafe(parentObj, address++, parentObj.memoryReader[data](parentObj, data++));
-					parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
-					parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
-				} while (address < 0xFEA0);
+					newData = parentObj.memoryReader[data](parentObj, data++);
+					if (newData != parentObj.memory[address]) {
+						//JIT the graphics render queue:
+						parentObj.modeSTAT = stat;
+						parentObj.graphicsJIT();
+						parentObj.modeSTAT = 0;
+						parentObj.memory[address++] = newData;
+						break;
+					}
+				} while (++address < 0xFEA0);
+				if (address < 0xFEA0) {
+					do {
+						parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
+						parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
+						parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
+						parentObj.memory[address++] = parentObj.memoryReader[data](parentObj, data++);
+					} while (address < 0xFEA0);
+				}
 				parentObj.modeSTAT = stat;
 			}
 		}
 		this.memoryHighWriter[0x47] = this.memoryWriter[0xFF47] = function (parentObj, address, data) {
 			if (parentObj.memory[0xFF47] != data) {
-				parentObj.renderMidScanLine();
+				parentObj.midScanLineJIT();
 				parentObj.updateGBBGPalette(data);
 				parentObj.memory[0xFF47] = data;
 			}
 		}
 		this.memoryHighWriter[0x48] = this.memoryWriter[0xFF48] = function (parentObj, address, data) {
 			if (parentObj.memory[0xFF48] != data) {
-				parentObj.renderMidScanLine();
+				parentObj.midScanLineJIT();
 				parentObj.updateGBOBJPalette(0, data);
 				parentObj.memory[0xFF48] = data;
 			}
 		}
 		this.memoryHighWriter[0x49] = this.memoryWriter[0xFF49] = function (parentObj, address, data) {
 			if (parentObj.memory[0xFF49] != data) {
-				parentObj.renderMidScanLine();
+				parentObj.midScanLineJIT();
 				parentObj.updateGBOBJPalette(4, data);
 				parentObj.memory[0xFF49] = data;
 			}
@@ -9349,18 +9606,14 @@ GameBoyCore.prototype.toTypedArray = function (baseArray, memtype) {
 			case "uint8":
 				var typedArrayTemp = new Uint8Array(length);
 				break;
-			case "uint16":
-				var typedArrayTemp = new Uint16Array(length);
+			case "int8":
+				var typedArrayTemp = new Int8Array(length);
 				break;
 			case "int32":
 				var typedArrayTemp = new Int32Array(length);
 				break;
 			case "float32":
 				var typedArrayTemp = new Float32Array(length);
-				break;
-			default:
-				cout("Could not convert an array to a typed array: Invalid type parameter.", 1);
-				return baseArray;
 		}
 		for (var index = 0; index < length; index++) {
 			typedArrayTemp[index] = baseArray[index];
@@ -9384,30 +9637,21 @@ GameBoyCore.prototype.fromTypedArray = function (baseArray) {
 		return arrayTemp;
 	}
 	catch (error) {
-		cout("Conversion from a typed array failed: " + error.message, 2);
+		cout("Conversion from a typed array failed: " + error.message, 1);
 		return baseArray;
 	}
 }
 GameBoyCore.prototype.getTypedArray = function (length, defaultValue, numberType) {
 	try {
 		if (settings[5]) {
-			throw(new Error(""));
+			throw(new Error("Settings forced typed arrays to be disabled."));
 		}
 		switch (numberType) {
-			case "uint8":
-				var arrayHandle = new Uint8Array(length);
-				break;
 			case "int8":
 				var arrayHandle = new Int8Array(length);
 				break;
-			case "uint16":
-				var arrayHandle = new Uint16Array(length);
-				break;
-			case "int16":
-				var arrayHandle = new Int16Array(length);
-				break;
-			case "uint32":
-				var arrayHandle = new Uint32Array(length);
+			case "uint8":
+				var arrayHandle = new Uint8Array(length);
 				break;
 			case "int32":
 				var arrayHandle = new Int32Array(length);
@@ -9415,7 +9659,7 @@ GameBoyCore.prototype.getTypedArray = function (length, defaultValue, numberType
 			case "float32":
 				var arrayHandle = new Float32Array(length);
 		}
-		if (defaultValue > 0) {
+		if (defaultValue != 0) {
 			var index = 0;
 			while (index < length) {
 				arrayHandle[index++] = defaultValue;
@@ -9423,43 +9667,12 @@ GameBoyCore.prototype.getTypedArray = function (length, defaultValue, numberType
 		}
 	}
 	catch (error) {
+		cout("Could not convert an array to a typed array: " + error.message, 1);
 		var arrayHandle = [];
 		var index = 0;
 		while (index < length) {
 			arrayHandle[index++] = defaultValue;
 		}
-	}
-	return arrayHandle;
-}
-GameBoyCore.prototype.ArrayPad = function (length, defaultValue) {
-	var arrayHandle = [];
-	var index = 0;
-	while (index < length) {
-		arrayHandle[index++] = defaultValue;
-	}
-	return arrayHandle;
-}
-GameBoyCore.prototype.resetOAMXCache = function () {
-	for (var index = 0; index < 168; ++index) {
-		this.OAMAddresses[index] = [];
-	}
-}
-GameBoyCore.prototype.returnOAMXCacheCopy = function (array) {
-	var arrayHandle = this.ArrayPad(168, null);
-	for (var subindex = 0; subindex < 168; subindex++) {
-		arrayHandle[subindex] = [];
-	}
-	if (array.length) {
-		var index = 0;
-		var length = 0;
-		while (index < length) {
-			length = array[index].length;
-			for (subindex = 0; subindex < length; subindex++) {
-				arrayHandle[index][subindex] = array[index][subindex];
-			}
-			++index;
-		}
-		cout("OAM sprite cached preserved.", 0);
 	}
 	return arrayHandle;
 }
